@@ -182,7 +182,12 @@ func (r *Repo) DeleteBill(ctx context.Context, groupID, billID, createdBy string
 // younger than the bill they need to drop.
 //
 // Both timestamps come from the same server and are only ever compared within
-// one group, so there is no cross-host clock to reason about. They are
+// one group, so there is no cross-host clock to reason about — but that is a
+// narrower claim than "no clock skew". A single host's wall clock can step
+// backwards, clock_timestamp() steps with it, and a settlement recorded after a
+// bill can then be stamped before it and stop freezing it. That hole is known
+// and open; shutting it needs an ordering source that cannot go backwards, not
+// a timestamp. They are
 // `DEFAULT clock_timestamp()`, not `now()`, and that difference is load-bearing:
 // now() is the transaction's start time, while what this comparison needs to
 // mean is whether the settlement could have *seen* the bill — which is commit
@@ -192,6 +197,15 @@ func (r *Repo) DeleteBill(ctx context.Context, groupID, billID, createdBy string
 // justified by, and this query would wave that bill's deletion through.
 // Stamping at insert puts the settlement's timestamp after the read that
 // admitted it, which is what makes "saw it" imply "younger than it".
+//
+// The comparison is `>=`, and the equality case is the point rather than a
+// rounding-off: clock_timestamp() is microsecond-resolution and two rows can
+// carry the identical stamp, so a settlement stamped exactly at the bill's
+// instant is one whose insert could not be ordered before the bill's. "Could not
+// have seen it" has to mean strictly older; equal is unknown, and unknown must
+// refuse. Loosened to `>`, the attacker's pair is deletable whenever the two
+// stamps collide, which is a timing question and therefore retryable for free.
+// Do not tidy this into `>`.
 //
 // The cost is real and accepted: a settlement anywhere in the group freezes
 // every bill recorded before it, not only the bill it paid for. The escape hatch

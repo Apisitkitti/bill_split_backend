@@ -79,12 +79,22 @@ type querier interface {
 // possible ones. It is taken as the first statement of both transactions, is
 // held until commit or rollback, and blocks nothing outside the group — two
 // different groups still settle in parallel.
+//
+// The key is derived from the group's *value*, not from the text it arrived as.
+// hashtextextended hashes text, and a uuid has several spellings Postgres reads
+// as one value, so hashing the caller's string handed one group two locks —
+// 'A0EE…' and 'a0ee…' hash differently while `= $1` matches both, and two
+// requests spelling the group differently serialised against nothing. The cast
+// makes the key the canonical form of the same value every WHERE clause
+// compares. Handlers canonicalise at the boundary too (see groupIDParam); this
+// cast is what keeps the lock correct for a caller that does not.
 func lockGroup(ctx context.Context, tx pgx.Tx, groupID string) error {
-	// hashtextextended takes the key as text, so a group ID that is not even a
-	// UUID locks harmlessly here rather than erroring before the query whose job
-	// it is to turn that into a miss.
-	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, groupID)
-	return err
+	// The cast rejects a group ID that is not a UUID, which is a miss rather
+	// than a 500: the query this lock precedes could not have matched a row
+	// either, and a prober must not learn that their guess was the wrong shape.
+	_, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 0))`, groupID)
+	return notFoundOnMalformedID(err)
 }
 
 // Repo holds the queries for every table.

@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -101,6 +103,76 @@ func mustUser(t *testing.T, r *Repo, ctx context.Context, id, name string) model
 		t.Fatalf("upsert %s: %v", id, err)
 	}
 	return u
+}
+
+// One group is one lock, whichever way its ID is spelled.
+//
+// This is the property the handler-level race tests demonstrate through their
+// outcomes; here it is asserted directly, because the outcome of a race is
+// evidence and a blocked lock is proof. hashtextextended hashes *text*, so
+// keying the lock on the string the caller sent gave 'A0EE…' and 'a0ee…' — one
+// value to every WHERE clause in this package — two different keys, and the two
+// transactions that were supposed to serialise ran straight past each other.
+func TestLockGroupIsTheSameLockWhateverTheSpelling(t *testing.T) {
+	r, ctx := newTestRepo(t)
+
+	alice := mustUser(t, r, ctx, "U_alice", "Alice")
+	group, err := r.CreateGroup(ctx, "Dinner", alice.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := r.CreateGroup(ctx, "Other", alice.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	held, err := r.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Rollback(ctx)
+	if err := lockGroup(ctx, held, group.ID); err != nil {
+		t.Fatalf("take the lock on the canonical spelling: %v", err)
+	}
+
+	// A second transaction naming the same group in a different spelling must
+	// wait. It cannot be waited on forever, so the block is observed as the
+	// context deadline arriving with the lock still not granted — pg_advisory_-
+	// xact_lock has no timeout of its own and never returns "busy".
+	for _, spelling := range []struct{ name, id string }{
+		{"uppercase", strings.ToUpper(group.ID)},
+		{"braced", "{" + group.ID + "}"},
+		{"unhyphenated", strings.ReplaceAll(group.ID, "-", "")},
+	} {
+		t.Run(spelling.name, func(t *testing.T) {
+			blocked, err := r.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocked.Rollback(context.Background())
+
+			waited, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer cancel()
+			if err := lockGroup(waited, blocked, spelling.id); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("the %s spelling took the lock while it was held on the canonical one (err %v) — that is two locks for one group",
+					spelling.name, err)
+			}
+		})
+	}
+
+	// The control: the lock is still group-scoped and not a global one, or the
+	// test above would pass with a lock that stops the whole database.
+	free, err := r.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer free.Rollback(ctx)
+
+	waited, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	if err := lockGroup(waited, free, other.ID); err != nil {
+		t.Fatalf("a different group blocked on this group's lock: %v", err)
+	}
 }
 
 // A path parameter that is not a UUID must be a miss, not a 500. Postgres

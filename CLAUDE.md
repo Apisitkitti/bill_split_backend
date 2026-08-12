@@ -157,8 +157,17 @@ make itest     # tests that need a live database
   any member would be left net-positive on settlements alone, and that is not
   sufficient: the two conditions have to hold for the *same* member, and an
   attacker splits them apart by taking a genuine incoming settlement that cancels
-  their outgoing one. Both `created_at` values come from one server and are
-  compared within one group, so no clock skew is involved. They are `DEFAULT
+  their outgoing one. Both `created_at` values come from one Postgres instance
+  and are compared within one group, so there is no *cross-host* skew to reason
+  about — which is not the same as the comparison being immune to clocks. One
+  host's wall clock can still step backwards (NTP correction, a manual set, a
+  VM restored from a snapshot), and `clock_timestamp()` follows it, so a
+  settlement recorded after a bill can be stamped before it and the guard would
+  release that bill. What the rule can honestly claim is that the ordering is
+  exact for a monotonic clock and that no second machine can disagree with the
+  first; a backwards step is a known, unmitigated hole, and closing it needs a
+  source that cannot go backwards — a sequence, or a commit-ordered LSN — rather
+  than a timestamp. They are `DEFAULT
   clock_timestamp()` rather than `now()`, and that is not a detail: `now()` is
   the *transaction start* time, while what the rule means by "older" is "could
   not have seen it", which follows commit order. Recording a bill takes no group

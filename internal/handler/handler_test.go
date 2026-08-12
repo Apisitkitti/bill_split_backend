@@ -153,6 +153,7 @@ func newTestApp(t *testing.T) *testApp {
 // rounds; building the test app from Register itself is tracked as MY-16.
 func (h *Handler) registerForTest(api fiber.Router) {
 	api.Post("/groups", h.createGroup)
+	api.Get("/groups/:id", h.getGroup)
 	api.Post("/groups/:id/members", h.joinGroup)
 
 	api.Get("/groups/:id/bills", h.listBills)
@@ -284,9 +285,14 @@ func (ta *testApp) netOf(t *testing.T, as, groupID, userID string) money.Satang 
 }
 
 // A group ID that is not a UUID must be the same 404 a non-member gets.
-// requireMember runs before every group-scoped handler, so this is the level the
+// groupIDParam runs before every group-scoped handler, so this is the level the
 // mapping has to hold at — repo.notFoundOnMalformedID on the delete queries is
 // never reached.
+//
+// It must be a 404 and not a 400: a 400 says "the wrong shape", which is one bit
+// more than a prober should get. GET /groups/:id is in the list because it does
+// not go through requireMember — its authorisation is the query's WHERE clause —
+// and until groupIDParam it answered a malformed ID with a bare 500.
 func TestMalformedGroupIDIsNotFound(t *testing.T) {
 	ta := newTestApp(t)
 	ta.mustUser(t, "U_alice")
@@ -294,6 +300,8 @@ func TestMalformedGroupIDIsNotFound(t *testing.T) {
 	paths := []struct {
 		method, path string
 	}{
+		{http.MethodGet, "/api/groups/not-a-uuid"},
+		{http.MethodPost, "/api/groups/not-a-uuid/members"},
 		{http.MethodDelete, "/api/groups/not-a-uuid/bills/also-not-a-uuid"},
 		{http.MethodGet, "/api/groups/not-a-uuid/bills"},
 		{http.MethodGet, "/api/groups/not-a-uuid/balances"},

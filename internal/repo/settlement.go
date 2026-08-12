@@ -49,6 +49,11 @@ func (r *Repo) CreateSettlement(ctx context.Context, s model.Settlement, bound f
 		return nil, err
 	}
 
+	// created_at is deliberately not supplied — the column's DEFAULT
+	// clock_timestamp() stamps the row at insert, which is necessarily after the
+	// ledger read above that admitted it. Naming the column here, with any value
+	// computed before this line, silently reopens the hole settlementNotOlderThan
+	// closes; see its comment in bill.go.
 	err = tx.QueryRow(ctx, `
 		INSERT INTO settlements (group_id, from_user, to_user, amount_satang, note)
 		VALUES ($1, $2, $3, $4, $5)

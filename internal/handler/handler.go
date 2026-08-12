@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 
 	"github.com/OatApisit/billsplit-api/internal/config"
 	"github.com/OatApisit/billsplit-api/internal/line"
@@ -57,6 +58,35 @@ func (h *Handler) me(c *fiber.Ctx) error {
 	return c.JSON(middleware.CurrentUser(c))
 }
 
+// groupIDParam is the one place the :id path segment becomes a group ID.
+//
+// Fiber hands back the raw path segment, and a UUID has several spellings that
+// Postgres reads as the same value: lowercase, uppercase, braced, unhyphenated.
+// `WHERE id = $1` accepts all of them because the comparison happens after the
+// uuid cast — which is harmless for a comparison and fatal for a *key*.
+// repo.lockGroup hashes the group ID as text, so two requests naming one group
+// in two spellings took two different advisory locks and serialised against
+// nothing at all: two settlements of 100.00 against a single 100.00 debt, one
+// path lowercase and one uppercase, were both admitted and turned the creditor
+// into a debtor. Canonicalising is what makes one group one lock.
+//
+// It belongs here rather than inside lockGroup because the lock is only one
+// consumer of this value. Fixing it there would leave the WHERE clauses, the
+// membership check, and anything added later still reading a string the caller
+// chose; past this line the group ID has exactly one spelling, and every
+// consumer agrees on it by construction.
+//
+// A segment that is not a UUID at all cannot name a group, so it gets the same
+// 404 a non-member gets — not a 400, which would tell a prober that their guess
+// was at least the wrong shape.
+func groupIDParam(c *fiber.Ctx) (string, error) {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return "", fiber.NewError(fiber.StatusNotFound, "group not found")
+	}
+	return id.String(), nil
+}
+
 // requireMember resolves the group in the URL, refusing callers who do not
 // belong to it.
 //
@@ -65,14 +95,19 @@ func (h *Handler) me(c *fiber.Ctx) error {
 // to someone outside the group, a group they cannot see and a group that does
 // not exist should be indistinguishable.
 func (h *Handler) requireMember(c *fiber.Ctx) (string, string, error) {
-	groupID := c.Params("id")
+	groupID, err := groupIDParam(c)
+	if err != nil {
+		return "", "", err
+	}
 	userID := middleware.CurrentUser(c).ID
 
 	member, err := h.repo.IsMember(c.UserContext(), groupID, userID)
 	if errors.Is(err, repo.ErrNotFound) {
-		// A group ID that is not even a UUID. This runs before every
-		// group-scoped handler, so without this arm a malformed :id would be a
-		// 500 here and never reach the 404 mapping the delete routes rely on.
+		// Unreachable while groupIDParam runs first — it has already refused
+		// anything Postgres would reject as a uuid. Kept because IsMember is
+		// callable without it, and because the arm costs one line while a
+		// malformed :id reaching Postgres bare is a 500 in front of every
+		// group-scoped route.
 		member, err = false, nil
 	}
 	if err != nil {
