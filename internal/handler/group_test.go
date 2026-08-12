@@ -1,11 +1,83 @@
 package handler
 
 import (
+	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
+
+	"github.com/OatApisit/billsplit-api/internal/model"
 )
+
+// The unit tests below prove validateCreateGroup rejects a user ID. This one
+// proves createGroup actually calls it.
+//
+// POST /groups is the only route in the API that requireMember cannot guard —
+// there is no group yet — so validateCreateGroup is its entire defence, and a
+// lineGroupId of "U..." aims the official LINE bot at an individual. Deleting
+// the validateCreateGroup call from createGroup fails this test.
+func TestCreateGroupRejectsAUserIDAsTheChatID(t *testing.T) {
+	ta := newTestApp(t)
+	ta.mustUser(t, "U_alice")
+
+	status, body := ta.do(t, "U_alice", http.MethodPost, "/api/groups",
+		fiber.Map{"name": "Dinner", "lineGroupId": "U1234567890abcdef1234567890abcdef"})
+	if status != http.StatusBadRequest {
+		t.Fatalf("POST /groups with a user ID as lineGroupId: %d %s, want 400", status, body)
+	}
+
+	groups, err := ta.repo.ListGroups(ta.ctx, "U_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 0 {
+		t.Errorf("got %d groups after the refused create, want 0", len(groups))
+	}
+}
+
+// A blank name is refused on the same route, for the same reason: the name
+// reaches a lock screen and nothing downstream re-checks it.
+func TestCreateGroupRejectsABlankName(t *testing.T) {
+	ta := newTestApp(t)
+	ta.mustUser(t, "U_alice")
+
+	status, body := ta.do(t, "U_alice", http.MethodPost, "/api/groups",
+		fiber.Map{"name": "   ", "lineGroupId": ""})
+	if status != http.StatusBadRequest {
+		t.Fatalf("POST /groups with a blank name: %d %s, want 400", status, body)
+	}
+}
+
+// The guard must not have swallowed the honest path: a real chat ID creates the
+// group, and a second member joins it through POST /groups/:id/members.
+func TestCreateGroupAcceptsAChatIDAndAdmitsAJoiner(t *testing.T) {
+	ta := newTestApp(t)
+	ta.mustUser(t, "U_alice")
+	ta.mustUser(t, "U_bob")
+
+	status, body := ta.do(t, "U_alice", http.MethodPost, "/api/groups",
+		fiber.Map{"name": "  Dinner  ", "lineGroupId": "C1234567890abcdef1234567890abcdef"})
+	if status != http.StatusCreated {
+		t.Fatalf("POST /groups: %d %s, want 201", status, body)
+	}
+	var group model.Group
+	if err := json.Unmarshal(body, &group); err != nil {
+		t.Fatal(err)
+	}
+	if group.Name != "Dinner" {
+		t.Errorf("stored name is %q, want %q — validateCreateGroup trims in place", group.Name, "Dinner")
+	}
+
+	status, body = ta.do(t, "U_bob", http.MethodPost, "/api/groups/"+group.ID+"/members", nil)
+	if status != http.StatusOK {
+		t.Fatalf("POST members: %d %s, want 200", status, body)
+	}
+	if net := ta.netOf(t, "U_bob", group.ID, "U_bob"); net != 0 {
+		t.Errorf("a joiner with no bills is at %s, want 0.00", net)
+	}
+}
 
 // lineGroupId arrives on a route that requireMember never guards, and it ends
 // up as the "to" of a bot push. LINE accepts user, group, and room IDs

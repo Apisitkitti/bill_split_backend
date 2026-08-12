@@ -23,9 +23,9 @@ var ErrNotFound = errors.New("repo: not found")
 // request, so it becomes a 500 rather than something the caller can fix.
 var ErrLedgerOverflow = errors.New("repo: ledger total exceeds exact JSON range")
 
-// ErrSettlementDepends reports a bill whose removal would strand a recorded
-// payment: some member would be left net-positive purely because they sent a
-// settlement, with no bill left to explain why they sent it.
+// ErrSettlementDepends reports a bill that cannot be withdrawn because the group
+// holds a settlement recorded at or after it, which that bill may have been what
+// justified.
 //
 // This is the other half of the reversibility argument behind DeleteBill. The
 // author of a bill and the sender of a settlement can be the same person, and

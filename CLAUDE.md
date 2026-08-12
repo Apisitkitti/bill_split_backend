@@ -147,11 +147,24 @@ make itest     # tests that need a live database
   someone else as payer, plus a settlement clearing the debt it invents — and
   retracting only the bill leaves the victim owing money for a payment that
   never happened, with no endpoint they can use to undo it. So a bill cannot be
-  deleted while any member would be left net-positive on settlements alone; that
+  deleted while the group holds any settlement recorded **at or after** it; that
   is a **409**, and the fix is for the settlement's sender to withdraw it first.
-  The honest cost: record a bill, get paid for it, then want to correct a typo,
-  and you must ask the payer to withdraw and re-record. Accepted, because bill
-  editing does not exist yet and the alternative is an unrecoverable theft.
+
+  The rule is about ordering, not balances. A settlement older than the bill
+  provably cannot have been justified by it, so it is safe to leave behind;
+  anything from the bill's own instant onwards might have been, so the bill
+  cannot be withdrawn out from under it. An earlier attempt asked instead whether
+  any member would be left net-positive on settlements alone, and that is not
+  sufficient: the two conditions have to hold for the *same* member, and an
+  attacker splits them apart by taking a genuine incoming settlement that cancels
+  their outgoing one. Both `created_at` values are Postgres `DEFAULT now()` from
+  one server, compared within one group, so no clock skew is involved.
+
+  The honest cost is larger than the previous rule's and is accepted: any
+  settlement freezes every bill older than it, not only the bill it paid for. So
+  record a bill, have anyone in the group pay anyone, then want to correct a
+  typo, and you must ask that sender to withdraw and re-record. Accepted, because
+  bill editing does not exist yet and the alternative is an unrecoverable theft.
 - Rate limiting.
 - Pagination on bill and settlement lists.
 

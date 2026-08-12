@@ -94,7 +94,15 @@ func newTestApp(t *testing.T) *testApp {
 // them in middleware.Auth, which needs a live LINE channel to verify against;
 // the stub above has already authenticated the caller, so everything from
 // requireMember inwards is still the production path.
+//
+// Every route Register mounts that has a guard of its own belongs here.
+// POST /groups is the one route requireMember cannot reach — its only defence is
+// validateCreateGroup — so leaving it unmounted meant that guard could be
+// deleted outright with the suite still green.
 func (h *Handler) registerForTest(api fiber.Router) {
+	api.Post("/groups", h.createGroup)
+	api.Post("/groups/:id/members", h.joinGroup)
+
 	api.Post("/groups/:id/bills", h.createBill)
 	api.Delete("/groups/:id/bills/:billId", h.deleteBill)
 	api.Get("/groups/:id/balances", h.balances)
