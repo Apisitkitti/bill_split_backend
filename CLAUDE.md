@@ -39,6 +39,35 @@ A change is done when `senior-go` says PASS, `qa-adversarial` has nothing
 CRITICAL or HIGH, and `po` says SHIPS. Correct code that does not help the user
 is not done.
 
+## Branching and pull requests
+
+Nothing lands on a branch by being written. It lands by passing the loop and
+then a pull request.
+
+```
+feature branch  →  PR into develop  →  develop  →  PR into main
+```
+
+- Every change starts on its own branch off `develop`. Never commit to
+  `develop` or `main` directly.
+- Branch names say what the change is: `feat/settlement-cap`,
+  `fix/delete-bill-guard`, `chore/split-repo-tests`.
+- Open the PR into `develop`. The PR body states what the change does, which
+  loop roles have signed off, and what is deliberately left out.
+- A PR merges into `develop` only when the loop has cleared it: the senior says
+  PASS, `qa-adversarial` has nothing CRITICAL or HIGH, `security` has nothing
+  CRITICAL or HIGH, and the PO says SHIPS.
+- `develop` reaches `main` by its own PR, once everything on it has been
+  exercised together. `main` is the branch that is supposed to work; a change
+  that has only ever been tested alone has not earned it.
+
+The gate is the same one the loop already applies — the PR is where it becomes
+visible to someone reading the repo six months from now, rather than living in
+a conversation nobody kept.
+
+Commit messages follow the same rule as comments: say why, not what. `git diff`
+already shows what changed.
+
 ## Rules this codebase holds itself to
 
 Reviews are graded against these, not against personal taste.
