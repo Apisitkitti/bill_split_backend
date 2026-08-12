@@ -50,6 +50,10 @@ feature branch  →  PR into develop  →  develop  →  PR into main
 
 - Every change starts on its own branch off `develop`. Never commit to
   `develop` or `main` directly.
+- **One branch, one feature.** A branch carries a single change with a single
+  reason to exist. Two unrelated fixes on one branch cannot be reviewed
+  separately, cannot be reverted separately, and force a reviewer to hold both
+  in their head at once — which is how the second one gets waved through.
 - Branch names say what the change is: `feat/settlement-cap`,
   `fix/delete-bill-guard`, `chore/split-repo-tests`.
 - Open the PR into `develop`. The PR body states what the change does, which
