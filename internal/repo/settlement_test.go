@@ -39,7 +39,7 @@ func TestDeleteSettlement(t *testing.T) {
 
 	s, err := r.CreateSettlement(ctx, model.Settlement{
 		GroupID: group.ID, FromUser: bob.ID, ToUser: alice.ID, Amount: 10000,
-	})
+	}, unbounded)
 	if err != nil {
 		t.Fatal(err)
 	}

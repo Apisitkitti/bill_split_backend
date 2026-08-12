@@ -2,7 +2,9 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
@@ -93,6 +95,132 @@ func TestDeleteBillRefusedWhileASettlementDependsOnIt(t *testing.T) {
 		"/api/groups/"+group+"/bills/"+bill.ID, nil)
 	if status != http.StatusNoContent {
 		t.Fatalf("deleting the bill once nothing depends on it: %d %s, want 204", status, body)
+	}
+}
+
+// The same theft, fired as two parallel requests instead of two sequential ones.
+//
+// The guard above is a check inside DeleteBill's transaction, and a check is
+// only worth what the locking behind it is worth. Postgres does not serialise
+// these two on its own: the DELETE takes a lock on the bills row, the settlement
+// INSERT takes one on a settlements row that did not exist yet, and under READ
+// COMMITTED neither transaction sees the other's uncommitted work. So the EXISTS
+// check found no settlement, the settlement's bound still saw the debt the bill
+// invented, and both committed — bill gone, settlement standing, Bob at -1000.00
+// for a payment nobody made. That was not a rare interleaving; it was the usual
+// outcome, and it is free to retry until it happens.
+//
+// Both transactions now take the same group-scoped advisory lock as their first
+// statement, which leaves only two orders: the delete commits first and the
+// settlement is refused for exceeding a debt that no longer exists, or the
+// settlement commits first and the delete is refused with a 409. Either way the
+// ledger stays at zero. Removing lockGroup from either repo.DeleteBill or
+// repo.CreateSettlement fails this test.
+func TestConcurrentSettlementAndBillDeleteCannotBothWin(t *testing.T) {
+	ta := newTestApp(t)
+
+	// Repeated because a race that is lost once proves nothing. With the lock
+	// removed this fails within the first four attempts every time it is run;
+	// this many makes a survivor a real result rather than luck.
+	//
+	// Which side wins is not asserted, and in practice the delete usually does:
+	// createSettlement does more work before it opens its transaction. The
+	// settlement-first ordering is what the sequential test above covers.
+	const attempts = 40
+
+	for i := range attempts {
+		group := ta.mustGroup(t, fmt.Sprintf("Race %d", i), "U_alice", "U_bob")
+
+		// Alice invents a bill naming Bob as payer with herself as the only
+		// participant: she owes Bob 1000, and Bob is owed 1000 by nobody real.
+		status, body := ta.do(t, "U_alice", http.MethodPost, "/api/groups/"+group+"/bills",
+			fiber.Map{
+				"title": "Invented", "total": "1000.00", "mode": "exact",
+				"payerId":      "U_bob",
+				"participants": []string{"U_alice"},
+				"shares":       []string{"1000.00"},
+			})
+		if status != http.StatusCreated {
+			t.Fatalf("attempt %d: POST bill: %d %s", i, status, body)
+		}
+		var bill model.Bill
+		if err := json.Unmarshal(body, &bill); err != nil {
+			t.Fatal(err)
+		}
+
+		// Both requests are held at the same gate and released together, so
+		// they are in flight at once rather than one after the other.
+		var (
+			wg                        sync.WaitGroup
+			start                     = make(chan struct{})
+			settleCode, deleteCode    int
+			settleBody, deleteBodyOut []byte
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			settleCode, settleBody = ta.do(t, "U_alice", http.MethodPost,
+				"/api/groups/"+group+"/settlements",
+				fiber.Map{"toUser": "U_bob", "amount": "1000.00"})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			deleteCode, deleteBodyOut = ta.do(t, "U_alice", http.MethodDelete,
+				"/api/groups/"+group+"/bills/"+bill.ID, nil)
+		}()
+		close(start)
+		wg.Wait()
+
+		settled := settleCode == http.StatusCreated
+		deleted := deleteCode == http.StatusNoContent
+		if settled == deleted {
+			t.Fatalf("attempt %d: settle=%d %s delete=%d %s — exactly one of the two must win",
+				i, settleCode, settleBody, deleteCode, deleteBodyOut)
+		}
+
+		bills, err := ta.repo.ListBills(ta.ctx, group)
+		if err != nil {
+			t.Fatal(err)
+		}
+		settlements, err := ta.repo.ListSettlements(ta.ctx, group)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		switch {
+		case settled:
+			// The settlement went first, so the bill it paid must still stand.
+			if deleteCode != http.StatusConflict {
+				t.Fatalf("attempt %d: settlement won but delete returned %d %s, want 409",
+					i, deleteCode, deleteBodyOut)
+			}
+			if len(bills) != 1 || len(settlements) != 1 {
+				t.Fatalf("attempt %d: settlement won with %d bills and %d settlements, want 1 and 1",
+					i, len(bills), len(settlements))
+			}
+		case deleted:
+			// The bill went first, so the debt behind the settlement was gone
+			// by the time its bound was read.
+			if settleCode != http.StatusBadRequest {
+				t.Fatalf("attempt %d: delete won but settle returned %d %s, want 400",
+					i, settleCode, settleBody)
+			}
+			if len(bills) != 0 || len(settlements) != 0 {
+				t.Fatalf("attempt %d: delete won with %d bills and %d settlements, want 0 and 0",
+					i, len(bills), len(settlements))
+			}
+		}
+
+		// Whoever won, nobody is left holding a debt for a payment that did not
+		// happen. This is the assertion the unlocked code failed.
+		for _, u := range []string{"U_alice", "U_bob"} {
+			if net := ta.netOf(t, u, group, u); net != 0 {
+				t.Fatalf("attempt %d: %s is at %s (settle=%d delete=%d), want 0.00",
+					i, u, net, settleCode, deleteCode)
+			}
+		}
 	}
 }
 

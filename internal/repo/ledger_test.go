@@ -119,7 +119,7 @@ func TestLedgerCountsSettlements(t *testing.T) {
 
 	if _, err := r.CreateSettlement(ctx, model.Settlement{
 		GroupID: group.ID, FromUser: bob.ID, ToUser: alice.ID, Amount: 10000,
-	}); err != nil {
+	}, unbounded); err != nil {
 		t.Fatal(err)
 	}
 

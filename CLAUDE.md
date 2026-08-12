@@ -177,8 +177,10 @@ make itest     # tests that need a live database
   really happened between two members the plan did not pair must still be
   recordable.
 
-  Two settlements posted concurrently are each checked against the same
-  pre-transaction balances, so a determined member can overpay by racing
-  themselves. The window is small and the result is reversible via `DELETE
-  /groups/:id/settlements/:settlementId`; closing it properly means computing the
-  balance inside the inserting transaction.
+  That bound is read inside the transaction that inserts, under a group-scoped
+  advisory lock that `repo.DeleteBill` takes as well. Concurrency is the whole
+  reason: without it, a settlement and a bill deletion each passed a check the
+  other had already invalidated — usually, not rarely — and left a member owing
+  money for a payment nobody made, which no endpoint of theirs can undo. Two
+  settlements racing each other are serialised by the same lock. Two different
+  groups still write in parallel.

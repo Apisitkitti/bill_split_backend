@@ -117,17 +117,27 @@ func (r *Repo) ListBills(ctx context.Context, groupID string) ([]model.Bill, err
 // non-member gets. Distinguishing "not yours" from "does not exist" would let a
 // member enumerate the bill IDs of groups they cannot see.
 //
-// The delete, the check, and the commit are one transaction. Doing the check
-// first and the delete after would leave a window in which a settlement lands
-// between them and is stranded anyway; here the deletion is speculative and the
-// rollback is what refuses it. The DELETE returns the bill's created_at because
-// the row is gone by the time the check runs.
+// The group lock is what makes the check mean anything. Statement order does
+// not: a settlement being inserted concurrently locks only its own new row, so
+// without the lock the EXISTS below cannot see it, the settlement's own bound is
+// computed from a ledger that still contains this bill, and both transactions
+// commit — leaving exactly the stranded settlement this function exists to
+// refuse. lockGroup and the matching lock in CreateSettlement force the two into
+// one order or the other, and in either order the second one is refused.
+//
+// Within the transaction the deletion is speculative: the DELETE runs first and
+// returns the bill's created_at, because the row is gone by the time the check
+// needs it, and the rollback is what refuses the delete.
 func (r *Repo) DeleteBill(ctx context.Context, groupID, billID, createdBy string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
+
+	if err := lockGroup(ctx, tx, groupID); err != nil {
+		return err
+	}
 
 	var billCreatedAt time.Time
 	err = tx.QueryRow(ctx, `

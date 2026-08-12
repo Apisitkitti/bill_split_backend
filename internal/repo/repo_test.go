@@ -6,6 +6,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/OatApisit/billsplit-api/internal/db"
 	"github.com/OatApisit/billsplit-api/internal/model"
 )
@@ -38,6 +40,8 @@ func newTestRepo(t *testing.T) (*Repo, context.Context) {
 	}
 	t.Cleanup(pool.Close)
 
+	holdSuiteLock(t, pool, ctx)
+
 	_, err = pool.Exec(ctx, `
 		TRUNCATE settlements, bill_shares, bills, group_members, groups, users CASCADE`)
 	if err != nil {
@@ -46,6 +50,39 @@ func newTestRepo(t *testing.T) (*Repo, context.Context) {
 
 	return New(pool), ctx
 }
+
+// suiteLockKey names the exclusive lock every database-backed test holds for its
+// duration. The identical helper lives in internal/handler's harness; the two
+// packages share one database and `go test ./...` runs them at the same time, so
+// without it this package's TRUNCATE lands in the middle of a handler test —
+// deadlocking against its open transactions, or simply deleting the group it is
+// working on.
+const suiteLockKey = 0x5717_1e5d
+
+func holdSuiteLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context) {
+	t.Helper()
+
+	// A session-level lock has to be taken and released on the same connection,
+	// so it is held on one checked out of the pool for the test's lifetime.
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire connection for the suite lock: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, suiteLockKey); err != nil {
+		t.Fatalf("take the suite lock: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, suiteLockKey); err != nil {
+			t.Errorf("release the suite lock: %v", err)
+		}
+		conn.Release()
+	})
+}
+
+// unbounded accepts whatever ledger CreateSettlement reads. The bound is the
+// handler's policy and is tested there; these tests are about the SQL, so they
+// say "any amount" explicitly rather than being able to pass nothing.
+func unbounded([]model.Ledger) error { return nil }
 
 func mustUser(t *testing.T, r *Repo, ctx context.Context, id, name string) model.User {
 	t.Helper()

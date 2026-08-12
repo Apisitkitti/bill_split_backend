@@ -36,7 +36,15 @@ func checkAggregate(userID string, paid, owed int64) error {
 // zero so the roster stays complete — a group where one person has done
 // nothing should still show them at 0.00 rather than omit them.
 func (r *Repo) Ledger(ctx context.Context, groupID string) ([]model.Ledger, error) {
-	rows, err := r.pool.Query(ctx, `
+	return ledger(ctx, r.pool, groupID)
+}
+
+// ledger is Ledger's body, taking the querier so that CreateSettlement can read
+// the totals its bound is checked against inside the transaction that inserts —
+// a read on the pool would be a separate snapshot taken outside the group lock,
+// which is the whole thing the lock exists to prevent.
+func ledger(ctx context.Context, q querier, groupID string) ([]model.Ledger, error) {
+	rows, err := q.Query(ctx, `
 		SELECT user_id, SUM(paid)::BIGINT, SUM(owed)::BIGINT
 		FROM (
 			SELECT user_id, 0 AS paid, 0 AS owed

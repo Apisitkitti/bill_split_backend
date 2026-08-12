@@ -8,8 +8,10 @@
 package repo
 
 import (
+	"context"
 	"errors"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -50,6 +52,38 @@ func notFoundOnMalformedID(err error) error {
 	if errors.As(err, &pgErr) && pgErr.Code == invalidTextRepresentation {
 		return ErrNotFound
 	}
+	return err
+}
+
+// querier is the part of pgx that both the pool and a transaction implement, so
+// a read can be written once and then run either on its own or inside the
+// transaction whose decision depends on it.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// lockGroup serialises the group's ledger-changing writes against each other.
+//
+// Recording a settlement and withdrawing a bill each check a condition that the
+// other one falsifies, and Postgres alone will not stop them: under READ
+// COMMITTED the DELETE locks only the bills row and the INSERT locks only the
+// settlements row, so the two transactions conflict on nothing, neither sees the
+// other's uncommitted work, and both checks pass. The pair then commits into
+// exactly the state each of them refused — the bill gone, the settlement that
+// paid it still standing, and its recipient owing money for a payment nobody
+// made. That outcome is unrecoverable: the recipient has no endpoint that undoes
+// a settlement they did not send.
+//
+// An advisory lock keyed on the group is what makes the two orderings the only
+// possible ones. It is taken as the first statement of both transactions, is
+// held until commit or rollback, and blocks nothing outside the group — two
+// different groups still settle in parallel.
+func lockGroup(ctx context.Context, tx pgx.Tx, groupID string) error {
+	// hashtextextended takes the key as text, so a group ID that is not even a
+	// UUID locks harmlessly here rather than erroring before the query whose job
+	// it is to turn that into a miss.
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, groupID)
 	return err
 }
 

@@ -48,6 +48,14 @@ func TestCreateGroupRejectsABlankName(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("POST /groups with a blank name: %d %s, want 400", status, body)
 	}
+
+	groups, err := ta.repo.ListGroups(ta.ctx, "U_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 0 {
+		t.Errorf("got %d groups after the refused create, want 0", len(groups))
+	}
 }
 
 // The guard must not have swallowed the honest path: a real chat ID creates the
