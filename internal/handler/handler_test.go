@@ -58,7 +58,17 @@ type testApp struct {
 // without it that package's TRUNCATE lands in the middle of a test here —
 // deadlocking against its open transactions, or simply deleting the group it is
 // working on.
-const suiteLockKey = 0x5717_1e5d
+//
+// It is taken in the two-argument form, which Postgres keeps in a different lock
+// space from the one-argument pg_advisory_xact_lock(bigint) that repo.lockGroup
+// uses. In one space they would be the same namespace, and a group whose
+// hashtextextended happened to equal this key would block on the suite lock
+// until the whole package finished. The odds are 1/2^64 and the cost of not
+// having to think about them is one extra argument.
+const (
+	suiteLockClass = 0x5717
+	suiteLockKey   = 0x1e5d
+)
 
 func holdSuiteLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context) {
 	t.Helper()
@@ -69,11 +79,11 @@ func holdSuiteLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context) {
 	if err != nil {
 		t.Fatalf("acquire connection for the suite lock: %v", err)
 	}
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, suiteLockKey); err != nil {
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, $2)`, suiteLockClass, suiteLockKey); err != nil {
 		t.Fatalf("take the suite lock: %v", err)
 	}
 	t.Cleanup(func() {
-		if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, suiteLockKey); err != nil {
+		if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1, $2)`, suiteLockClass, suiteLockKey); err != nil {
 			t.Errorf("release the suite lock: %v", err)
 		}
 		conn.Release()
@@ -178,6 +188,13 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // do issues a request as the given user and returns the status and body.
+//
+// It reports failures with t.Errorf and returns rather than t.Fatal, because the
+// race tests call it from goroutines that are not the test's own: t.Fatal is
+// documented as only valid on the goroutine running the test, and its
+// runtime.Goexit there would kill the wrong goroutine, leak the WaitGroup it was
+// counted into, and hang the suite instead of failing it. A zero status is not
+// silent — every caller checks the status it expected.
 func (ta *testApp) do(t *testing.T, as, method, path string, body any) (int, []byte) {
 	t.Helper()
 
@@ -185,7 +202,8 @@ func (ta *testApp) do(t *testing.T, as, method, path string, body any) (int, []b
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
-			t.Fatal(err)
+			t.Errorf("%s %s: marshal body: %v", method, path, err)
+			return 0, nil
 		}
 		reader = bytes.NewReader(raw)
 	}
@@ -198,13 +216,15 @@ func (ta *testApp) do(t *testing.T, as, method, path string, body any) (int, []b
 
 	res, err := ta.app.Test(req, -1)
 	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
+		t.Errorf("%s %s: %v", method, path, err)
+		return 0, nil
 	}
 	defer res.Body.Close()
 
 	out, err := io.ReadAll(res.Body)
 	if err != nil {
-		t.Fatal(err)
+		t.Errorf("%s %s: read body: %v", method, path, err)
+		return 0, nil
 	}
 	return res.StatusCode, out
 }

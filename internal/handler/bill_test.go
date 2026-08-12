@@ -192,6 +192,14 @@ func TestConcurrentSettlementAndBillDeleteCannotBothWin(t *testing.T) {
 		switch {
 		case settled:
 			// The settlement went first, so the bill it paid must still stand.
+			//
+			// Do not read this branch as coverage of that ordering: instrumented
+			// over 400 attempts it ran once or twice, because createSettlement
+			// does more work before it opens its transaction and the delete
+			// almost always gets the lock first. What actually covers a
+			// settlement-then-delete is the sequential test at the top of this
+			// file, and the late-bill test below. This branch is here so that
+			// the rare run is checked rather than skipped.
 			if deleteCode != http.StatusConflict {
 				t.Fatalf("attempt %d: settlement won but delete returned %d %s, want 409",
 					i, deleteCode, deleteBodyOut)
@@ -222,6 +230,156 @@ func TestConcurrentSettlementAndBillDeleteCannotBothWin(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A settlement admitted against a bill that committed while it waited must
+// freeze that bill.
+//
+// The test above cannot see this, because both requests leave the same gate: the
+// settlement's transaction never begins meaningfully before the bill exists.
+// Here the bill is created while a settlement is already parked on the group
+// lock, which is the ordering that broke the guard:
+//
+//  1. the settlement transaction BEGINs and blocks in lockGroup;
+//  2. a bill commits — CreateBill takes no lock, so nothing stops it;
+//  3. the settlement gets the lock, reads a ledger that now holds that bill, and
+//     is admitted against it;
+//  4. under DEFAULT now() it is stamped with its BEGIN time, from before the
+//     bill existed, so the delete guard reads it as older and lets the bill go.
+//
+// The bill is then gone with the settlement it justified still standing, and its
+// recipient has no endpoint that undoes a settlement they did not send.
+// DEFAULT clock_timestamp() is what closes it: the row is stamped at insert,
+// which is necessarily after the ledger read that admitted it. Reverting
+// settlements.created_at in migration 0002 to now() fails this test — that is
+// the side the stamp has to be late on, and bills.created_at is moved with it
+// only because one rule stamped two ways is a rule nobody can check.
+//
+// No privileged database session is needed to park a settlement — a burst of
+// concurrent settlement POSTs queues on the group lock on its own.
+//
+// What the burst cannot control is where the bill lands, so the group opens
+// owing nothing at all: every settlement fired before the bill commits is
+// refused by the bound for exceeding the 0.00 that can be settled. An accepted
+// settlement is therefore proof that this one read a ledger already holding the
+// late bill — which is the property the guard's timestamp has to agree with.
+// Attempts where the bill won outright, and every settlement was refused, prove
+// nothing and are retried on a fresh group.
+//
+// Sizing the opening debt instead — five settlements' worth, so that a sixth
+// acceptance implies the late bill — does not work: the burst may simply have
+// begun after the bill committed, and that run passes with now() too. It was
+// written that way first and the mutant survived it.
+func TestSettlementAdmittedAgainstALateBillFreezesIt(t *testing.T) {
+	ta := newTestApp(t)
+
+	const (
+		// Whether an admitted settlement began before the bill is a coin toss
+		// per attempt, so one attempt is not a test. Reverted to now(), eleven
+		// measured runs failed on attempts ranging from 3 to 33; this is that
+		// worst case with room to spare, and it costs about half a second.
+		attempts = 100
+		// Enough concurrent settlements to keep the lock queue non-empty for
+		// the length of a bill insert, without exhausting the pool.
+		burst = 8
+		// The bill invents enough debt for the whole burst, so nothing is
+		// refused once it is visible and the count is not capped by the bound.
+		billTotal = "800.00"
+		perSettle = "100.00"
+		// One reproduction could be luck in the other direction — a run where
+		// every admitted settlement happened to begin after the bill anyway.
+		wantReproductions = 3
+	)
+
+	seen := 0
+	for i := range attempts {
+		group := ta.mustGroup(t, fmt.Sprintf("Late bill %d", i), "U_alice", "U_bob")
+
+		var (
+			wg       sync.WaitGroup
+			start    = make(chan struct{})
+			codes    = make([]int, burst)
+			billCode int
+			billBody []byte
+		)
+		wg.Add(burst + 1)
+		for k := range burst {
+			go func() {
+				defer wg.Done()
+				<-start
+				codes[k], _ = ta.do(t, "U_alice", http.MethodPost,
+					"/api/groups/"+group+"/settlements",
+					fiber.Map{"toUser": "U_bob", "amount": perSettle})
+			}()
+		}
+		// Alice invents a bill naming Bob as payer with herself as the only
+		// participant: it is the only thing that can make any of the burst
+		// admissible, and it is created while the burst is already queued.
+		go func() {
+			defer wg.Done()
+			<-start
+			billCode, billBody = ta.do(t, "U_alice", http.MethodPost,
+				"/api/groups/"+group+"/bills", fiber.Map{
+					"title": "Late", "total": billTotal, "mode": "exact",
+					"payerId":      "U_bob",
+					"participants": []string{"U_alice"},
+					"shares":       []string{billTotal},
+				})
+		}()
+		close(start)
+		wg.Wait()
+
+		if billCode != http.StatusCreated {
+			t.Fatalf("attempt %d: POST late bill: %d %s", i, billCode, billBody)
+		}
+		var late model.Bill
+		if err := json.Unmarshal(billBody, &late); err != nil {
+			t.Fatal(err)
+		}
+
+		admitted := 0
+		for _, code := range codes {
+			if code == http.StatusCreated {
+				admitted++
+			}
+		}
+		if admitted == 0 {
+			// The bill committed after the whole burst had been refused, so
+			// nothing here was admitted against it and this attempt says
+			// nothing. Try again on a fresh group.
+			continue
+		}
+
+		// Every admitted settlement was admitted against the late bill, so
+		// withdrawing it would strand a payment that has already been made.
+		status, body := ta.do(t, "U_alice", http.MethodDelete,
+			"/api/groups/"+group+"/bills/"+late.ID, nil)
+		if status != http.StatusConflict {
+			t.Fatalf("attempt %d: deleting a bill %d settlements were admitted against: %d %s, want 409",
+				i, admitted, status, body)
+		}
+
+		// Bob paid nothing and only received Alice's transfers, so here he can
+		// only ever be owed money. Negative is the unrecoverable state this is
+		// all about: it means Alice's payments outlived the bill that justified
+		// them, and Bob has no endpoint that undoes a settlement he did not
+		// send. Had the delete gone through he would sit at minus everything she
+		// sent.
+		if net := ta.netOf(t, "U_bob", group, "U_bob"); net < 0 {
+			t.Fatalf("attempt %d: bob is at %s after %d settlements and a refused delete, want no worse than 0.00",
+				i, net, admitted)
+		}
+		seen++
+	}
+
+	// Every attempt is run rather than stopping at the first few reproductions:
+	// which admitted settlements began before the bill varies run to run, and
+	// with the stamp reverted to now() it is the unlucky attempt that catches it.
+	if seen < wantReproductions {
+		t.Fatalf("only %d of %d attempts admitted a settlement against the concurrently created bill, want at least %d; the burst is no longer parking on the lock and this test is not testing anything",
+			seen, attempts, wantReproductions)
+	}
+	t.Logf("reproduced the late-bill interleaving on %d of %d attempts", seen, attempts)
 }
 
 // The same theft, laundered through a second, entirely genuine transfer.

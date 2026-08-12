@@ -181,9 +181,17 @@ func (r *Repo) DeleteBill(ctx context.Context, groupID, billID, createdBy string
 // whatever else the attacker arranges, the settlement they need to keep is
 // younger than the bill they need to drop.
 //
-// Both timestamps are Postgres `DEFAULT now()` values from the same server and
-// are only ever compared within one group, so there is no cross-host clock to
-// reason about.
+// Both timestamps come from the same server and are only ever compared within
+// one group, so there is no cross-host clock to reason about. They are
+// `DEFAULT clock_timestamp()`, not `now()`, and that difference is load-bearing:
+// now() is the transaction's start time, while what this comparison needs to
+// mean is whether the settlement could have *seen* the bill — which is commit
+// order. CreateBill takes no group lock, so a settlement can BEGIN, block here
+// on the group lock while a bill commits, and then be admitted against a ledger
+// containing it; stamped at BEGIN it would look older than the bill it was
+// justified by, and this query would wave that bill's deletion through.
+// Stamping at insert puts the settlement's timestamp after the read that
+// admitted it, which is what makes "saw it" imply "younger than it".
 //
 // The cost is real and accepted: a settlement anywhere in the group freezes
 // every bill recorded before it, not only the bill it paid for. The escape hatch

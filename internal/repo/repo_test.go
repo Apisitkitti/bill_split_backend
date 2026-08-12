@@ -57,7 +57,17 @@ func newTestRepo(t *testing.T) (*Repo, context.Context) {
 // without it this package's TRUNCATE lands in the middle of a handler test —
 // deadlocking against its open transactions, or simply deleting the group it is
 // working on.
-const suiteLockKey = 0x5717_1e5d
+//
+// It is taken in the two-argument form, which Postgres keeps in a different lock
+// space from the one-argument pg_advisory_xact_lock(bigint) that lockGroup uses.
+// In one space they would be the same namespace, and a group whose
+// hashtextextended happened to equal this key would block on the suite lock
+// until the whole package finished. The odds are 1/2^64 and the cost of not
+// having to think about them is one extra argument.
+const (
+	suiteLockClass = 0x5717
+	suiteLockKey   = 0x1e5d
+)
 
 func holdSuiteLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context) {
 	t.Helper()
@@ -68,11 +78,11 @@ func holdSuiteLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context) {
 	if err != nil {
 		t.Fatalf("acquire connection for the suite lock: %v", err)
 	}
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, suiteLockKey); err != nil {
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, $2)`, suiteLockClass, suiteLockKey); err != nil {
 		t.Fatalf("take the suite lock: %v", err)
 	}
 	t.Cleanup(func() {
-		if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, suiteLockKey); err != nil {
+		if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1, $2)`, suiteLockClass, suiteLockKey); err != nil {
 			t.Errorf("release the suite lock: %v", err)
 		}
 		conn.Release()

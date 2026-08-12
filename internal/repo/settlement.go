@@ -20,6 +20,12 @@ import (
 // settlement and a bill deletion each pass a check the other had already
 // invalidated. bound's error is returned unwrapped so the handler's
 // fiber.NewError reaches the client intact.
+//
+// bound runs while the group-wide advisory lock is held, so it must stay pure
+// arithmetic over the ledger it is handed. Anything that waits — a query, an
+// HTTP call to LINE, a lookup of its own — stalls every other writer in the
+// group behind it for as long as it takes, and a slow bound becomes a group-wide
+// outage rather than a slow request.
 func (r *Repo) CreateSettlement(ctx context.Context, s model.Settlement, bound func([]model.Ledger) error) (*model.Settlement, error) {
 	if bound == nil {
 		return nil, errors.New("repo: CreateSettlement needs a bound")

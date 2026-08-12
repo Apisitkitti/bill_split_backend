@@ -157,8 +157,15 @@ make itest     # tests that need a live database
   any member would be left net-positive on settlements alone, and that is not
   sufficient: the two conditions have to hold for the *same* member, and an
   attacker splits them apart by taking a genuine incoming settlement that cancels
-  their outgoing one. Both `created_at` values are Postgres `DEFAULT now()` from
-  one server, compared within one group, so no clock skew is involved.
+  their outgoing one. Both `created_at` values come from one server and are
+  compared within one group, so no clock skew is involved. They are `DEFAULT
+  clock_timestamp()` rather than `now()`, and that is not a detail: `now()` is
+  the *transaction start* time, while what the rule means by "older" is "could
+  not have seen it", which follows commit order. Recording a bill takes no group
+  lock, so a settlement can begin, wait for the lock while a bill commits, be
+  admitted against that bill, and still carry a stamp from before it existed —
+  and the guard would then wave the bill's deletion through. Stamping at insert
+  puts the row's timestamp after the reads that admitted it.
 
   The honest cost is larger than the previous rule's and is accepted: any
   settlement freezes every bill older than it, not only the bill it paid for. So
