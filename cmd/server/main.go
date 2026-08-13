@@ -72,6 +72,10 @@ func run() error {
 	})
 
 	app.Use(recover.New())
+	// Before anything that touches the database, and before auth, which queries
+	// too. Every query below this line runs on a context with a deadline that
+	// dies with the client; above it there is no such context to inherit.
+	app.Use(middleware.RequestContext(middleware.DefaultRequestTimeout))
 	app.Use(logger.New(logger.Config{
 		Format: "${time} ${status} ${latency} ${method} ${path}\n",
 	}))

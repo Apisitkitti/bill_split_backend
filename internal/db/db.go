@@ -20,6 +20,10 @@ func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("db: parse DATABASE_URL: %w", err)
 	}
 
+	// Ten is the ceiling, and pgxpool queues anyone who arrives past it without
+	// limit. The bound on that queue is repo's poolAcquireTimeout — this number
+	// on its own decides only how many requests make progress, not how long the
+	// rest wait.
 	cfg.MaxConns = 10
 	cfg.MaxConnLifetime = time.Hour
 	cfg.MaxConnIdleTime = 30 * time.Minute
