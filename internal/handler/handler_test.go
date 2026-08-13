@@ -50,6 +50,12 @@ type testApp struct {
 	app  *fiber.App
 	repo *repo.Repo
 	ctx  context.Context
+
+	// pool is the same pool repo is built on. The deadline and capacity tests
+	// need it directly: one runs a query no repo function would ever write, and
+	// another has to take every connection out of circulation to see what a
+	// caller gets when there are none left.
+	pool *pgxpool.Pool
 }
 
 // suiteLockKey names the exclusive lock every database-backed test holds for its
@@ -120,10 +126,14 @@ func newTestApp(t *testing.T) *testApp {
 		t.Fatalf("truncate: %v (did you run the migration?)", err)
 	}
 
-	ta := &testApp{repo: repo.New(pool), ctx: ctx}
+	ta := &testApp{repo: repo.New(pool), ctx: ctx, pool: pool}
 	h := New(ta.repo, &config.Config{}, stubPusher())
 
 	ta.app = fiber.New()
+	// The same middleware cmd/server mounts, with the same budget. Without it
+	// c.UserContext() is context.Background() and these tests would exercise
+	// handlers that no deadline applies to — which is the bug MY-8 fixed.
+	ta.app.Use(middleware.RequestContext(middleware.DefaultRequestTimeout))
 	api := ta.app.Group("/api", func(c *fiber.Ctx) error {
 		caller := c.Get(callerHeader)
 		c.Locals(userLocalsKey, model.User{ID: caller})

@@ -136,9 +136,10 @@ func TestLockGroupIsTheSameLockWhateverTheSpelling(t *testing.T) {
 	}
 
 	// A second transaction naming the same group in a different spelling must
-	// wait. It cannot be waited on forever, so the block is observed as the
-	// context deadline arriving with the lock still not granted — pg_advisory_-
-	// xact_lock has no timeout of its own and never returns "busy".
+	// wait. The block is observed as the caller's own 500ms deadline arriving
+	// with the lock still not granted, which is well inside groupLockTimeout —
+	// so what this asserts is still "it blocked", not "it gave up". The bound on
+	// the wait itself is TestLockGroupGivesUpRatherThanQueueingOnAConnection.
 	for _, spelling := range []struct{ name, id string }{
 		{"uppercase", strings.ToUpper(group.ID)},
 		{"braced", "{" + group.ID + "}"},
@@ -172,6 +173,60 @@ func TestLockGroupIsTheSameLockWhateverTheSpelling(t *testing.T) {
 	defer cancel()
 	if err := lockGroup(waited, free, other.ID); err != nil {
 		t.Fatalf("a different group blocked on this group's lock: %v", err)
+	}
+}
+
+// A writer that cannot have the group's lock gives up instead of queueing on it.
+//
+// The wait is the expensive kind: the transaction is already open, so it is
+// holding one of the pool's ten connections and doing nothing with it. Ten of
+// those and the pool is gone, and the next request — for any group at all — has
+// nothing to run on. This is the bound that makes the queue shed its tail, and
+// the caller loses with an error that says "retry" rather than hanging.
+//
+// The context here carries no deadline of its own, so nothing but lock_timeout
+// can end this wait. Removing the set_config from lockGroup hangs this test
+// until the package times out.
+func TestLockGroupGivesUpRatherThanQueueingOnAConnection(t *testing.T) {
+	r, ctx := newTestRepo(t)
+
+	alice := mustUser(t, r, ctx, "U_alice", "Alice")
+	group, err := r.CreateGroup(ctx, "Dinner", alice.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	held, err := r.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Rollback(ctx)
+	if err := lockGroup(ctx, held, group.ID); err != nil {
+		t.Fatalf("take the lock: %v", err)
+	}
+
+	blocked, err := r.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocked.Rollback(context.Background())
+
+	start := time.Now()
+	err = lockGroup(ctx, blocked, group.ID)
+	waited := time.Since(start)
+
+	if !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("waiting on a held group lock: got %v, want ErrGroupBusy", err)
+	}
+	// ErrSettlementDepends is the other refusal a caller can meet on this path
+	// and it means the opposite — a permanent no, with a different remedy. A
+	// caller that cannot tell them apart either retries forever or gives up on
+	// something that would have worked.
+	if errors.Is(err, ErrSettlementDepends) {
+		t.Error("a busy group is reported as a settlement dependency")
+	}
+	if waited > 2*groupLockTimeout {
+		t.Errorf("waited %v for a lock bounded at %v", waited, groupLockTimeout)
 	}
 }
 
