@@ -40,13 +40,15 @@ func (h *Handler) balances(c *fiber.Ctx) error {
 }
 
 // groupBalances is everything the balance computation produces: the per-member
-// rows the client renders, the transfer plan, the raw net positions the
-// settlement bound is checked against, and the member lookup the chat summary
-// needs for names.
+// rows the client renders, the transfer plan, and the member lookup the chat
+// summary needs for names.
+//
+// The net positions are not here. The settlement bound needs them read inside
+// the transaction that inserts, which is a ledger this function never sees; see
+// netsOf.
 type groupBalances struct {
 	entries   []balanceEntry
 	transfers []settle.Transfer
-	nets      map[string]money.Satang
 	byID      map[string]model.User
 }
 
@@ -68,13 +70,7 @@ func (h *Handler) computeBalances(c *fiber.Ctx, groupID string) (*groupBalances,
 		byID[m.ID] = m
 	}
 
-	paid := make(map[string]money.Satang, len(ledger))
-	owed := make(map[string]money.Satang, len(ledger))
-	for _, l := range ledger {
-		paid[l.UserID] = l.Paid
-		owed[l.UserID] = l.Owed
-	}
-
+	paid, owed := ledgerTotals(ledger)
 	balances := settle.Net(paid, owed)
 	transfers, err := settle.Minimize(balances)
 	if err != nil {
@@ -85,9 +81,7 @@ func (h *Handler) computeBalances(c *fiber.Ctx, groupID string) (*groupBalances,
 	}
 
 	entries := make([]balanceEntry, 0, len(balances))
-	nets := make(map[string]money.Satang, len(balances))
 	for _, b := range balances {
-		nets[b.UserID] = b.Net
 		entries = append(entries, balanceEntry{
 			User: byID[b.UserID],
 			Paid: paid[b.UserID],
@@ -95,7 +89,30 @@ func (h *Handler) computeBalances(c *fiber.Ctx, groupID string) (*groupBalances,
 			Net:  b.Net,
 		})
 	}
-	return &groupBalances{entries: entries, transfers: transfers, nets: nets, byID: byID}, nil
+	return &groupBalances{entries: entries, transfers: transfers, byID: byID}, nil
+}
+
+// ledgerTotals splits the ledger rows into the two maps settle.Net takes.
+func ledgerTotals(ledger []model.Ledger) (paid, owed map[string]money.Satang) {
+	paid = make(map[string]money.Satang, len(ledger))
+	owed = make(map[string]money.Satang, len(ledger))
+	for _, l := range ledger {
+		paid[l.UserID] = l.Paid
+		owed[l.UserID] = l.Owed
+	}
+	return paid, owed
+}
+
+// netsOf reduces a ledger to net positions, which is all the settlement bound
+// needs — no member names, no transfer plan, nothing that would require a second
+// query inside the transaction holding the group lock.
+func netsOf(ledger []model.Ledger) map[string]money.Satang {
+	balances := settle.Net(ledgerTotals(ledger))
+	nets := make(map[string]money.Satang, len(balances))
+	for _, b := range balances {
+		nets[b.UserID] = b.Net
+	}
+	return nets
 }
 
 type createSettlementRequest struct {
@@ -151,22 +168,25 @@ func (h *Handler) createSettlement(c *fiber.Ctx) error {
 	// bounded by the debt: without this, any member can post an arbitrary
 	// amount and drive another member's balance to nonsense that no endpoint
 	// can undo except by deleting the settlement again.
-	balances, err := h.computeBalances(c, groupID)
-	if err != nil {
-		return err
-	}
-	limit := outstandingTo(balances.nets, userID, req.ToUser)
-	if amount > limit {
-		return fiber.NewError(fiber.StatusBadRequest,
-			"amount exceeds the "+limit.String()+" that can be settled between you and this member")
-	}
-
+	//
+	// The bound is handed to the repo rather than checked here first, so that the
+	// ledger it reads is the one visible inside the inserting transaction, under
+	// the group lock. Checked out here, it would be a snapshot from before the
+	// lock, and a concurrent bill deletion could remove the debt this settlement
+	// was admitted against.
 	settlement, err := h.repo.CreateSettlement(c.UserContext(), model.Settlement{
 		GroupID:  groupID,
 		FromUser: userID,
 		ToUser:   req.ToUser,
 		Amount:   amount,
 		Note:     strings.TrimSpace(req.Note),
+	}, func(ledger []model.Ledger) error {
+		limit := outstandingTo(netsOf(ledger), userID, req.ToUser)
+		if amount > limit {
+			return fiber.NewError(fiber.StatusBadRequest,
+				"amount exceeds the "+limit.String()+" that can be settled between you and this member")
+		}
+		return nil
 	})
 	if err != nil {
 		return err

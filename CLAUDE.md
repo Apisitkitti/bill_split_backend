@@ -201,11 +201,40 @@ make itest     # tests that need a live database
   someone else as payer, plus a settlement clearing the debt it invents — and
   retracting only the bill leaves the victim owing money for a payment that
   never happened, with no endpoint they can use to undo it. So a bill cannot be
-  deleted while any member would be left net-positive on settlements alone; that
+  deleted while the group holds any settlement recorded **at or after** it; that
   is a **409**, and the fix is for the settlement's sender to withdraw it first.
-  The honest cost: record a bill, get paid for it, then want to correct a typo,
-  and you must ask the payer to withdraw and re-record. Accepted, because bill
-  editing does not exist yet and the alternative is an unrecoverable theft.
+
+  The rule is about ordering, not balances. A settlement older than the bill
+  provably cannot have been justified by it, so it is safe to leave behind;
+  anything from the bill's own instant onwards might have been, so the bill
+  cannot be withdrawn out from under it. An earlier attempt asked instead whether
+  any member would be left net-positive on settlements alone, and that is not
+  sufficient: the two conditions have to hold for the *same* member, and an
+  attacker splits them apart by taking a genuine incoming settlement that cancels
+  their outgoing one. Both `created_at` values come from one Postgres instance
+  and are compared within one group, so there is no *cross-host* skew to reason
+  about — which is not the same as the comparison being immune to clocks. One
+  host's wall clock can still step backwards (NTP correction, a manual set, a
+  VM restored from a snapshot), and `clock_timestamp()` follows it, so a
+  settlement recorded after a bill can be stamped before it and the guard would
+  release that bill. What the rule can honestly claim is that the ordering is
+  exact for a monotonic clock and that no second machine can disagree with the
+  first; a backwards step is a known, unmitigated hole, and closing it needs a
+  source that cannot go backwards — a sequence, or a commit-ordered LSN — rather
+  than a timestamp. They are `DEFAULT
+  clock_timestamp()` rather than `now()`, and that is not a detail: `now()` is
+  the *transaction start* time, while what the rule means by "older" is "could
+  not have seen it", which follows commit order. Recording a bill takes no group
+  lock, so a settlement can begin, wait for the lock while a bill commits, be
+  admitted against that bill, and still carry a stamp from before it existed —
+  and the guard would then wave the bill's deletion through. Stamping at insert
+  puts the row's timestamp after the reads that admitted it.
+
+  The honest cost is larger than the previous rule's and is accepted: any
+  settlement freezes every bill older than it, not only the bill it paid for. So
+  record a bill, have anyone in the group pay anyone, then want to correct a
+  typo, and you must ask that sender to withdraw and re-record. Accepted, because
+  bill editing does not exist yet and the alternative is an unrecoverable theft.
 - Rate limiting.
 - Pagination on bill and settlement lists.
 
@@ -218,8 +247,10 @@ make itest     # tests that need a live database
   really happened between two members the plan did not pair must still be
   recordable.
 
-  Two settlements posted concurrently are each checked against the same
-  pre-transaction balances, so a determined member can overpay by racing
-  themselves. The window is small and the result is reversible via `DELETE
-  /groups/:id/settlements/:settlementId`; closing it properly means computing the
-  balance inside the inserting transaction.
+  That bound is read inside the transaction that inserts, under a group-scoped
+  advisory lock that `repo.DeleteBill` takes as well. Concurrency is the whole
+  reason: without it, a settlement and a bill deletion each passed a check the
+  other had already invalidated — usually, not rarely — and left a member owing
+  money for a payment nobody made, which no endpoint of theirs can undo. Two
+  settlements racing each other are serialised by the same lock. Two different
+  groups still write in parallel.

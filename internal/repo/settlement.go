@@ -2,15 +2,59 @@ package repo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/OatApisit/billsplit-api/internal/model"
 	"github.com/OatApisit/billsplit-api/internal/money"
 )
 
-// CreateSettlement records a payment between two members.
-func (r *Repo) CreateSettlement(ctx context.Context, s model.Settlement) (*model.Settlement, error) {
-	err := r.pool.QueryRow(ctx, `
+// CreateSettlement records a payment between two members, admitting it only if
+// bound accepts the group's ledger as read inside the same transaction.
+//
+// The bound itself stays with the caller: how much a member may settle is
+// policy, and policy that returns an HTTP status does not belong in the package
+// that owns the SQL. What belongs here is when the numbers it judges are read.
+// Computing them in the handler and inserting afterwards leaves the decision
+// resting on a snapshot from before the group was locked, which is what let a
+// settlement and a bill deletion each pass a check the other had already
+// invalidated. bound's error is returned unwrapped so the handler's
+// fiber.NewError reaches the client intact.
+//
+// bound runs while the group-wide advisory lock is held, so it must stay pure
+// arithmetic over the ledger it is handed. Anything that waits — a query, an
+// HTTP call to LINE, a lookup of its own — stalls every other writer in the
+// group behind it for as long as it takes, and a slow bound becomes a group-wide
+// outage rather than a slow request.
+func (r *Repo) CreateSettlement(ctx context.Context, s model.Settlement, bound func([]model.Ledger) error) (*model.Settlement, error) {
+	if bound == nil {
+		return nil, errors.New("repo: CreateSettlement needs a bound")
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := lockGroup(ctx, tx, s.GroupID); err != nil {
+		return nil, err
+	}
+
+	entries, err := ledger(ctx, tx, s.GroupID)
+	if err != nil {
+		return nil, err
+	}
+	if err := bound(entries); err != nil {
+		return nil, err
+	}
+
+	// created_at is deliberately not supplied — the column's DEFAULT
+	// clock_timestamp() stamps the row at insert, which is necessarily after the
+	// ledger read above that admitted it. Naming the column here, with any value
+	// computed before this line, silently reopens the hole settlementNotOlderThan
+	// closes; see its comment in bill.go.
+	err = tx.QueryRow(ctx, `
 		INSERT INTO settlements (group_id, from_user, to_user, amount_satang, note)
 		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, created_at`,
@@ -18,6 +62,10 @@ func (r *Repo) CreateSettlement(ctx context.Context, s model.Settlement) (*model
 	).Scan(&s.ID, &s.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("repo: insert settlement: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 	return &s, nil
 }

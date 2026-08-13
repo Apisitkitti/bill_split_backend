@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/OatApisit/billsplit-api/internal/db"
 	"github.com/OatApisit/billsplit-api/internal/model"
@@ -38,6 +42,8 @@ func newTestRepo(t *testing.T) (*Repo, context.Context) {
 	}
 	t.Cleanup(pool.Close)
 
+	holdSuiteLock(t, pool, ctx)
+
 	_, err = pool.Exec(ctx, `
 		TRUNCATE settlements, bill_shares, bills, group_members, groups, users CASCADE`)
 	if err != nil {
@@ -47,6 +53,49 @@ func newTestRepo(t *testing.T) (*Repo, context.Context) {
 	return New(pool), ctx
 }
 
+// suiteLockKey names the exclusive lock every database-backed test holds for its
+// duration. The identical helper lives in internal/handler's harness; the two
+// packages share one database and `go test ./...` runs them at the same time, so
+// without it this package's TRUNCATE lands in the middle of a handler test —
+// deadlocking against its open transactions, or simply deleting the group it is
+// working on.
+//
+// It is taken in the two-argument form, which Postgres keeps in a different lock
+// space from the one-argument pg_advisory_xact_lock(bigint) that lockGroup uses.
+// In one space they would be the same namespace, and a group whose
+// hashtextextended happened to equal this key would block on the suite lock
+// until the whole package finished. The odds are 1/2^64 and the cost of not
+// having to think about them is one extra argument.
+const (
+	suiteLockClass = 0x5717
+	suiteLockKey   = 0x1e5d
+)
+
+func holdSuiteLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context) {
+	t.Helper()
+
+	// A session-level lock has to be taken and released on the same connection,
+	// so it is held on one checked out of the pool for the test's lifetime.
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire connection for the suite lock: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, $2)`, suiteLockClass, suiteLockKey); err != nil {
+		t.Fatalf("take the suite lock: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1, $2)`, suiteLockClass, suiteLockKey); err != nil {
+			t.Errorf("release the suite lock: %v", err)
+		}
+		conn.Release()
+	})
+}
+
+// unbounded accepts whatever ledger CreateSettlement reads. The bound is the
+// handler's policy and is tested there; these tests are about the SQL, so they
+// say "any amount" explicitly rather than being able to pass nothing.
+func unbounded([]model.Ledger) error { return nil }
+
 func mustUser(t *testing.T, r *Repo, ctx context.Context, id, name string) model.User {
 	t.Helper()
 	u := model.User{ID: id, DisplayName: name}
@@ -54,6 +103,76 @@ func mustUser(t *testing.T, r *Repo, ctx context.Context, id, name string) model
 		t.Fatalf("upsert %s: %v", id, err)
 	}
 	return u
+}
+
+// One group is one lock, whichever way its ID is spelled.
+//
+// This is the property the handler-level race tests demonstrate through their
+// outcomes; here it is asserted directly, because the outcome of a race is
+// evidence and a blocked lock is proof. hashtextextended hashes *text*, so
+// keying the lock on the string the caller sent gave 'A0EE…' and 'a0ee…' — one
+// value to every WHERE clause in this package — two different keys, and the two
+// transactions that were supposed to serialise ran straight past each other.
+func TestLockGroupIsTheSameLockWhateverTheSpelling(t *testing.T) {
+	r, ctx := newTestRepo(t)
+
+	alice := mustUser(t, r, ctx, "U_alice", "Alice")
+	group, err := r.CreateGroup(ctx, "Dinner", alice.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := r.CreateGroup(ctx, "Other", alice.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	held, err := r.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Rollback(ctx)
+	if err := lockGroup(ctx, held, group.ID); err != nil {
+		t.Fatalf("take the lock on the canonical spelling: %v", err)
+	}
+
+	// A second transaction naming the same group in a different spelling must
+	// wait. It cannot be waited on forever, so the block is observed as the
+	// context deadline arriving with the lock still not granted — pg_advisory_-
+	// xact_lock has no timeout of its own and never returns "busy".
+	for _, spelling := range []struct{ name, id string }{
+		{"uppercase", strings.ToUpper(group.ID)},
+		{"braced", "{" + group.ID + "}"},
+		{"unhyphenated", strings.ReplaceAll(group.ID, "-", "")},
+	} {
+		t.Run(spelling.name, func(t *testing.T) {
+			blocked, err := r.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocked.Rollback(context.Background())
+
+			waited, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer cancel()
+			if err := lockGroup(waited, blocked, spelling.id); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("the %s spelling took the lock while it was held on the canonical one (err %v) — that is two locks for one group",
+					spelling.name, err)
+			}
+		})
+	}
+
+	// The control: the lock is still group-scoped and not a global one, or the
+	// test above would pass with a lock that stops the whole database.
+	free, err := r.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer free.Rollback(ctx)
+
+	waited, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	if err := lockGroup(waited, free, other.ID); err != nil {
+		t.Fatalf("a different group blocked on this group's lock: %v", err)
+	}
 }
 
 // A path parameter that is not a UUID must be a miss, not a 500. Postgres

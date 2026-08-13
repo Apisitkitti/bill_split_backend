@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -116,10 +117,17 @@ func (r *Repo) ListBills(ctx context.Context, groupID string) ([]model.Bill, err
 // non-member gets. Distinguishing "not yours" from "does not exist" would let a
 // member enumerate the bill IDs of groups they cannot see.
 //
-// The delete, the check, and the commit are one transaction. Doing the check
-// first and the delete after would leave a window in which a settlement lands
-// between them and is stranded anyway; here the deletion is speculative and the
-// rollback is what refuses it.
+// The group lock is what makes the check mean anything. Statement order does
+// not: a settlement being inserted concurrently locks only its own new row, so
+// without the lock the EXISTS below cannot see it, the settlement's own bound is
+// computed from a ledger that still contains this bill, and both transactions
+// commit — leaving exactly the stranded settlement this function exists to
+// refuse. lockGroup and the matching lock in CreateSettlement force the two into
+// one order or the other, and in either order the second one is refused.
+//
+// Within the transaction the deletion is speculative: the DELETE runs first and
+// returns the bill's created_at, because the row is gone by the time the check
+// needs it, and the rollback is what refuses the delete.
 func (r *Repo) DeleteBill(ctx context.Context, groupID, billID, createdBy string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -127,75 +135,93 @@ func (r *Repo) DeleteBill(ctx context.Context, groupID, billID, createdBy string
 	}
 	defer tx.Rollback(ctx)
 
-	tag, err := tx.Exec(ctx, `
+	if err := lockGroup(ctx, tx, groupID); err != nil {
+		return err
+	}
+
+	var billCreatedAt time.Time
+	err = tx.QueryRow(ctx, `
 		DELETE FROM bills
-		WHERE id = $1 AND group_id = $2 AND created_by = $3`,
-		billID, groupID, createdBy)
+		WHERE id = $1 AND group_id = $2 AND created_by = $3
+		RETURNING created_at`,
+		billID, groupID, createdBy).Scan(&billCreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
 		return notFoundOnMalformedID(err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
 
-	stranded, err := strandedSettlementPayer(ctx, tx, groupID)
+	depends, err := settlementNotOlderThan(ctx, tx, groupID, billCreatedAt)
 	if err != nil {
 		return err
 	}
-	if stranded {
+	if depends {
 		return ErrSettlementDepends
 	}
 
 	return tx.Commit(ctx)
 }
 
-// strandedSettlementPayer reports whether the group, as it stands inside this
-// transaction, holds a member who is net-positive *and* got there by sending
-// settlements.
+// settlementNotOlderThan reports whether the group holds any settlement created
+// at or after the given instant — the created_at of the bill being deleted.
 //
-// That combination is the signature of the attack DeleteBill exists to stop.
-// A settlement is only ever accepted up to what its sender owes, so sending one
-// can move the sender to zero but never past it — unless a bill is retracted
-// underneath it afterwards. A member whose settlements have left them owed money
-// is therefore claiming a credit that no bill justifies, and the member on the
-// other side has no endpoint to undo it: they cannot delete a bill they did not
-// author, nor a settlement they did not send.
+// The rule is deliberately about time rather than about balances. A settlement
+// recorded *before* the bill existed provably cannot have been justified by that
+// bill, so withdrawing the bill cannot strand it and it is safe to leave behind.
+// Anything recorded at or after the bill might have been sent because of it, so
+// the bill cannot be pulled out from under it.
 //
-// Note that the bound mirrors createSettlement's: neither party may cross zero.
-// Here the same rule is applied to the state the deletion would leave behind.
-func strandedSettlementPayer(ctx context.Context, tx pgx.Tx, groupID string) (bool, error) {
-	var userID string
+// The earlier attempt at this asked instead whether any member would be left
+// net-positive on settlements alone, and it is not sufficient: the two
+// conditions have to hold for the same member, and an attacker can break that
+// apart by taking an unrelated, genuine incoming settlement that cancels their
+// outgoing one. Their net stays positive while their settlements net to zero, no
+// row matches, and the delete proceeds. Ordering does not have that seam —
+// whatever else the attacker arranges, the settlement they need to keep is
+// younger than the bill they need to drop.
+//
+// Both timestamps come from the same server and are only ever compared within
+// one group, so there is no cross-host clock to reason about — but that is a
+// narrower claim than "no clock skew". A single host's wall clock can step
+// backwards, clock_timestamp() steps with it, and a settlement recorded after a
+// bill can then be stamped before it and stop freezing it. That hole is known
+// and open; shutting it needs an ordering source that cannot go backwards, not
+// a timestamp. They are
+// `DEFAULT clock_timestamp()`, not `now()`, and that difference is load-bearing:
+// now() is the transaction's start time, while what this comparison needs to
+// mean is whether the settlement could have *seen* the bill — which is commit
+// order. CreateBill takes no group lock, so a settlement can BEGIN, block here
+// on the group lock while a bill commits, and then be admitted against a ledger
+// containing it; stamped at BEGIN it would look older than the bill it was
+// justified by, and this query would wave that bill's deletion through.
+// Stamping at insert puts the settlement's timestamp after the read that
+// admitted it, which is what makes "saw it" imply "younger than it".
+//
+// The comparison is `>=`, and the equality case is the point rather than a
+// rounding-off: clock_timestamp() is microsecond-resolution and two rows can
+// carry the identical stamp, so a settlement stamped exactly at the bill's
+// instant is one whose insert could not be ordered before the bill's. "Could not
+// have seen it" has to mean strictly older; equal is unknown, and unknown must
+// refuse. Loosened to `>`, the attacker's pair is deletable whenever the two
+// stamps collide, which is a timing question and therefore retryable for free.
+// Do not tidy this into `>`.
+//
+// The cost is real and accepted: a settlement anywhere in the group freezes
+// every bill recorded before it, not only the bill it paid for. The escape hatch
+// is unchanged — the sender withdraws the settlement, the author deletes the
+// bill, the settlement goes back in.
+func settlementNotOlderThan(ctx context.Context, tx pgx.Tx, groupID string, since time.Time) (bool, error) {
+	var exists bool
 	err := tx.QueryRow(ctx, `
-		SELECT user_id FROM (
-			SELECT payer_id AS user_id, total_satang AS paid, 0 AS owed,
-			       0 AS sent, 0 AS received
-			FROM bills WHERE group_id = $1
-
-			UNION ALL
-			SELECT s.user_id, 0, s.share_satang, 0, 0
-			FROM bill_shares s
-			JOIN bills b ON b.id = s.bill_id
-			WHERE b.group_id = $1
-
-			UNION ALL
-			SELECT from_user, amount_satang, 0, amount_satang, 0
-			FROM settlements WHERE group_id = $1
-
-			UNION ALL
-			SELECT to_user, 0, amount_satang, 0, amount_satang
-			FROM settlements WHERE group_id = $1
-		) entries
-		GROUP BY user_id
-		HAVING SUM(paid) - SUM(owed) > 0 AND SUM(sent) - SUM(received) > 0
-		LIMIT 1`, groupID).Scan(&userID)
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
+		SELECT EXISTS (
+			SELECT 1 FROM settlements
+			WHERE group_id = $1 AND created_at >= $2
+		)`, groupID, since).Scan(&exists)
 	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return exists, nil
 }
 
 // HasBills reports whether a group has any expense recorded against it.

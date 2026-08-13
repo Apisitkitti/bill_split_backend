@@ -8,8 +8,10 @@
 package repo
 
 import (
+	"context"
 	"errors"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -23,9 +25,9 @@ var ErrNotFound = errors.New("repo: not found")
 // request, so it becomes a 500 rather than something the caller can fix.
 var ErrLedgerOverflow = errors.New("repo: ledger total exceeds exact JSON range")
 
-// ErrSettlementDepends reports a bill whose removal would strand a recorded
-// payment: some member would be left net-positive purely because they sent a
-// settlement, with no bill left to explain why they sent it.
+// ErrSettlementDepends reports a bill that cannot be withdrawn because the group
+// holds a settlement recorded at or after it, which that bill may have been what
+// justified.
 //
 // This is the other half of the reversibility argument behind DeleteBill. The
 // author of a bill and the sender of a settlement can be the same person, and
@@ -51,6 +53,48 @@ func notFoundOnMalformedID(err error) error {
 		return ErrNotFound
 	}
 	return err
+}
+
+// querier is the part of pgx that both the pool and a transaction implement, so
+// a read can be written once and then run either on its own or inside the
+// transaction whose decision depends on it.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// lockGroup serialises the group's ledger-changing writes against each other.
+//
+// Recording a settlement and withdrawing a bill each check a condition that the
+// other one falsifies, and Postgres alone will not stop them: under READ
+// COMMITTED the DELETE locks only the bills row and the INSERT locks only the
+// settlements row, so the two transactions conflict on nothing, neither sees the
+// other's uncommitted work, and both checks pass. The pair then commits into
+// exactly the state each of them refused — the bill gone, the settlement that
+// paid it still standing, and its recipient owing money for a payment nobody
+// made. That outcome is unrecoverable: the recipient has no endpoint that undoes
+// a settlement they did not send.
+//
+// An advisory lock keyed on the group is what makes the two orderings the only
+// possible ones. It is taken as the first statement of both transactions, is
+// held until commit or rollback, and blocks nothing outside the group — two
+// different groups still settle in parallel.
+//
+// The key is derived from the group's *value*, not from the text it arrived as.
+// hashtextextended hashes text, and a uuid has several spellings Postgres reads
+// as one value, so hashing the caller's string handed one group two locks —
+// 'A0EE…' and 'a0ee…' hash differently while `= $1` matches both, and two
+// requests spelling the group differently serialised against nothing. The cast
+// makes the key the canonical form of the same value every WHERE clause
+// compares. Handlers canonicalise at the boundary too (see groupIDParam); this
+// cast is what keeps the lock correct for a caller that does not.
+func lockGroup(ctx context.Context, tx pgx.Tx, groupID string) error {
+	// The cast rejects a group ID that is not a UUID, which is a miss rather
+	// than a 500: the query this lock precedes could not have matched a row
+	// either, and a prober must not learn that their guess was the wrong shape.
+	_, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 0))`, groupID)
+	return notFoundOnMalformedID(err)
 }
 
 // Repo holds the queries for every table.

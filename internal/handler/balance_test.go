@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/OatApisit/billsplit-api/internal/model"
 	"github.com/OatApisit/billsplit-api/internal/money"
 )
 
@@ -148,5 +150,76 @@ func TestCreateSettlementRejectsMoreThanIsOwed(t *testing.T) {
 	}
 	if net := ta.netOf(t, "U_alice", group, "U_alice"); net != 0 {
 		t.Errorf("alice is at %s after being paid in full, want 0.00", net)
+	}
+}
+
+// pushSummary has two guards of its own, and until this test they were mounted
+// nowhere: the group must be linked to a LINE chat, and it must have at least
+// one bill.
+//
+// The second is the interesting one. A summary of an empty group is close to the
+// payload a phishing attempt wants — the caller's own group name, delivered by
+// the official bot, with no figures to contradict it — and while the gate does
+// not close that path (see the comment on pushSummary), a deleted gate should
+// not be free either. Deleting either check fails this test.
+func TestPushSummaryRefusesAnUnlinkedOrEmptyGroup(t *testing.T) {
+	ta := newTestApp(t)
+	ta.mustUser(t, "U_alice")
+	ta.mustUser(t, "U_bob")
+
+	unlinked := ta.mustGroup(t, "Browser opened", "U_alice", "U_bob")
+	status, body := ta.do(t, "U_alice", http.MethodPost, "/api/groups/"+unlinked+"/summary", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("summarising a group bound to no chat: %d %s, want 400", status, body)
+	}
+
+	status, body = ta.do(t, "U_alice", http.MethodPost, "/api/groups",
+		fiber.Map{"name": "Dinner", "lineGroupId": "C1234567890abcdef1234567890abcdef"})
+	if status != http.StatusCreated {
+		t.Fatalf("POST /groups: %d %s, want 201", status, body)
+	}
+	var group model.Group
+	if err := json.Unmarshal(body, &group); err != nil {
+		t.Fatal(err)
+	}
+
+	status, body = ta.do(t, "U_alice", http.MethodPost, "/api/groups/"+group.ID+"/summary", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("summarising a group with no bills: %d %s, want 400", status, body)
+	}
+
+	// A real group is not blocked: one bill is all it takes.
+	status, body = ta.do(t, "U_alice", http.MethodPost, "/api/groups/"+group.ID+"/bills",
+		fiber.Map{
+			"title": "Dinner", "total": "100.00", "mode": "equal",
+			"participants": []string{"U_alice"},
+		})
+	if status != http.StatusCreated {
+		t.Fatalf("POST bill: %d %s", status, body)
+	}
+	status, body = ta.do(t, "U_alice", http.MethodPost, "/api/groups/"+group.ID+"/summary", nil)
+	if status != http.StatusOK {
+		t.Fatalf("summarising a linked group with a bill: %d %s, want 200", status, body)
+	}
+}
+
+// The list routes are read paths, and their whole defence is requireMember: a
+// non-member must not be able to read a group's bills or its recorded payments,
+// and must not be able to tell that group from one that does not exist.
+func TestListRoutesAreClosedToNonMembers(t *testing.T) {
+	ta := newTestApp(t)
+	group := ta.mustGroup(t, "Dinner", "U_alice")
+	ta.mustUser(t, "U_stranger")
+
+	for _, path := range []string{"/bills", "/settlements"} {
+		t.Run(path, func(t *testing.T) {
+			status, body := ta.do(t, "U_stranger", http.MethodGet, "/api/groups/"+group+path, nil)
+			if status != http.StatusNotFound {
+				t.Fatalf("a non-member reading %s: %d %s, want 404", path, status, body)
+			}
+			if status, body = ta.do(t, "U_alice", http.MethodGet, "/api/groups/"+group+path, nil); status != http.StatusOK {
+				t.Fatalf("a member reading %s: %d %s, want 200", path, status, body)
+			}
+		})
 	}
 }

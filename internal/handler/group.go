@@ -129,7 +129,18 @@ func (h *Handler) createGroup(c *fiber.Ctx) error {
 
 func (h *Handler) getGroup(c *fiber.Ctx) error {
 	user := middleware.CurrentUser(c)
-	group, err := h.repo.GetGroup(c.UserContext(), c.Params("id"), user.ID)
+
+	// These two routes do not go through requireMember — their authorisation is
+	// the WHERE clause of the query itself — so they canonicalise the ID here.
+	// Every path that turns :id into a group ID goes through groupIDParam, which
+	// is what keeps "one group, one spelling" a property of the whole layer
+	// rather than of the handlers somebody remembered.
+	groupID, err := groupIDParam(c)
+	if err != nil {
+		return err
+	}
+
+	group, err := h.repo.GetGroup(c.UserContext(), groupID, user.ID)
 	if err != nil {
 		return notFoundAsHTTP(err)
 	}
@@ -147,7 +158,10 @@ func (h *Handler) getGroup(c *fiber.Ctx) error {
 // see. Anything else would let a prober sort real IDs from invented ones by the
 // status code alone.
 func (h *Handler) joinGroup(c *fiber.Ctx) error {
-	groupID := c.Params("id")
+	groupID, err := groupIDParam(c)
+	if err != nil {
+		return err
+	}
 	user := middleware.CurrentUser(c)
 
 	if err := h.repo.AddMember(c.UserContext(), groupID, user.ID); err != nil {
