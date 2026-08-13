@@ -71,15 +71,7 @@ func run() error {
 		WriteTimeout: 15 * time.Second,
 	})
 
-	app.Use(recover.New())
-	app.Use(logger.New(logger.Config{
-		Format: "${time} ${status} ${latency} ${method} ${path}\n",
-	}))
-	app.Use(cors.New(cors.Config{
-		AllowOrigins: strings.Join(cfg.AllowedOrigins, ","),
-		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
-		AllowMethods: "GET, POST, PATCH, DELETE, OPTIONS",
-	}))
+	mountMiddleware(app, cfg.AllowedOrigins, middleware.DefaultRequestTimeout)
 
 	handler.New(store, cfg, pusher).Register(app.Group("/api"), auth)
 
@@ -94,6 +86,36 @@ func run() error {
 
 	slog.Info("listening", "port", cfg.Port)
 	return app.Listen(":" + cfg.Port)
+}
+
+// mountMiddleware mounts the server's middleware in the order the server needs
+// them, and is a function rather than four lines in run() because that order is
+// part of the contract and has to be testable.
+//
+// RequestContext goes *below* logger, and this is not cosmetic. Fiber's logger
+// hands a handler error to app.ErrorHandler itself and then returns nil
+// (middleware/logger/logger.go), so anything mounted above logger sees nil from
+// c.Next() and never gets to translate the error: with RequestContext on top,
+// every deadline, every ErrPoolBusy and every ErrGroupBusy reached the client as
+// a bare 500 while asHTTP looked at a nil error. It stays above Register, so the
+// auth middleware's own queries still run on a deadline.
+//
+// requestTimeout is a parameter only so a test can use a budget it can wait for;
+// the server always passes middleware.DefaultRequestTimeout.
+func mountMiddleware(app *fiber.App, allowedOrigins []string, requestTimeout time.Duration) {
+	app.Use(recover.New())
+	app.Use(logger.New(logger.Config{
+		Format: "${time} ${status} ${latency} ${method} ${path}\n",
+	}))
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: strings.Join(allowedOrigins, ","),
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
+		AllowMethods: "GET, POST, PATCH, DELETE, OPTIONS",
+	}))
+	// Below logger and cors, above every route: each query under this line runs
+	// on a context with a deadline, and above it there is no such context to
+	// inherit.
+	app.Use(middleware.RequestContext(requestTimeout))
 }
 
 // errorHandler renders errors as JSON and keeps unexpected ones off the wire.

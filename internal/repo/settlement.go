@@ -77,8 +77,23 @@ func (r *Repo) CreateSettlement(ctx context.Context, s model.Settlement, bound f
 // from the authenticated caller and nothing else — so from_user is the row's
 // author, and matching on it is the ownership check. Same WHERE-clause
 // authorisation and same ErrNotFound as DeleteBill.
+//
+// The single statement runs in an explicit transaction, which looks like
+// ceremony and is not. Sent bare, it is an implicit transaction that Postgres
+// commits at the end of the same round trip, so a request deadline landing in
+// that round trip deleted the row and reported a 504 asking the caller to try
+// again — and the retry answers 404, leaving the sender believing a settlement
+// they withdrew is still standing. Only poolTx.Commit can detach a commit from
+// the request's deadline, so the write has to be inside one to be protected by
+// it.
 func (r *Repo) DeleteSettlement(ctx context.Context, groupID, settlementID, fromUser string) error {
-	tag, err := r.pool.Exec(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx, `
 		DELETE FROM settlements
 		WHERE id = $1 AND group_id = $2 AND from_user = $3`,
 		settlementID, groupID, fromUser)
@@ -88,7 +103,7 @@ func (r *Repo) DeleteSettlement(ctx context.Context, groupID, settlementID, from
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // ListSettlements returns a group's recorded payments, newest first.

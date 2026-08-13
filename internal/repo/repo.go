@@ -10,6 +10,8 @@ package repo
 import (
 	"context"
 	"errors"
+	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -35,9 +37,37 @@ var ErrLedgerOverflow = errors.New("repo: ledger total exceeds exact JSON range"
 // in their favour that the victim has no endpoint to undo. See deleteBill.
 var ErrSettlementDepends = errors.New("repo: a recorded settlement depends on this bill")
 
+// ErrGroupBusy reports that the group's writers are queued deeper than
+// groupLockTimeout allows, so this one gave up without doing anything.
+//
+// It is a "come back in a moment", not a refusal: nothing about the request was
+// wrong and nothing was written. It must stay distinct from ErrSettlementDepends
+// — that one is a permanent no with a different remedy (the settlement's sender
+// withdraws it first), and telling a caller to retry it would send them round a
+// loop that can never succeed.
+var ErrGroupBusy = errors.New("repo: the group is busy")
+
+// ErrOutcomeUnknown reports a commit that neither completed nor provably failed
+// within commitTimeout. It is the one write failure that must not be answered
+// with "please try again": the transaction may be committed, and a retry would
+// record the same money twice.
+//
+// It exists because the detachment in poolTx.Commit is bounded rather than
+// unlimited. Inside that bound the outcome is binary and the caller is told the
+// truth; past it nothing this process can observe says which way the commit went,
+// so the honest answer is to say so and send the caller to look rather than to
+// guess. It should be vanishingly rare — three seconds is a thousand commits'
+// worth of round trip — and one in the logs means the database stalled, not that
+// the request was odd.
+var ErrOutcomeUnknown = errors.New("repo: the commit outcome could not be determined")
+
 // foreignKeyViolation is the SQLSTATE Postgres returns when a row references a
 // parent that is not there.
 const foreignKeyViolation = "23503"
+
+// lockNotAvailable is the SQLSTATE Postgres returns when lock_timeout expires
+// with the lock still not granted.
+const lockNotAvailable = "55P03"
 
 // invalidTextRepresentation is the SQLSTATE Postgres returns for input that is
 // not a valid value of the column's type — here, a path parameter that is not
@@ -88,17 +118,63 @@ type querier interface {
 // makes the key the canonical form of the same value every WHERE clause
 // compares. Handlers canonicalise at the boundary too (see groupIDParam); this
 // cast is what keeps the lock correct for a caller that does not.
+// The wait for it is bounded, and that bound is the difference between a queue
+// and an outage. A transaction parked on this lock is holding one of the pool's
+// ten connections and making no progress, so ten members writing to one group
+// while that group's lock is held by anything slow empties the pool — and a
+// member of an entirely different group, whose own query touches one indexed
+// row, then waits behind them for a lock they have nothing to do with. Measured
+// on this tree with one group's lock held: ten in-flight settlements took all
+// ten connections and an unrelated group's membership check was still blocked
+// after fifteen seconds.
+//
+// groupLockTimeout ends that. A queue that is too deep sheds its tail instead of
+// consuming the pool, and the loser is told to retry rather than being left
+// hanging on a connection.
 func lockGroup(ctx context.Context, tx pgx.Tx, groupID string) error {
+	// SET LOCAL, so the bound expires with the transaction and cannot ride a
+	// pooled connection into the next request that borrows it. set_config is
+	// used rather than SET because SET cannot take a bind parameter, and the
+	// alternative is formatting a number into SQL text.
+	if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`,
+		strconv.FormatInt(groupLockTimeout.Milliseconds(), 10)); err != nil {
+		return err
+	}
+
 	// The cast rejects a group ID that is not a UUID, which is a miss rather
 	// than a 500: the query this lock precedes could not have matched a row
 	// either, and a prober must not learn that their guess was the wrong shape.
 	_, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 0))`, groupID)
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == lockNotAvailable {
+		// Nothing has been written — the lock is the transaction's first
+		// statement — so this is safe to retry and says so.
+		return ErrGroupBusy
+	}
 	return notFoundOnMalformedID(err)
 }
 
+// groupLockTimeout bounds how long a writer waits for its group's lock.
+//
+// It is deliberately the shortest of the three budgets. Waiting on this lock is
+// the only one of them that is done *while holding a pooled connection*, so it
+// has to expire well before poolAcquireTimeout: a request for an unrelated group
+// gives up on the pool after five seconds, and the queue on this lock has to
+// have released its connections by then or that request fails for a reason that
+// has nothing to do with it.
+//
+// Two seconds is far more than honest contention needs. The group's writers hold
+// the lock for one ledger read and one insert — single-digit milliseconds — so
+// two seconds absorbs a queue hundreds deep before anyone is turned away, and
+// the concurrency tests in internal/handler, which deliberately pile requests
+// onto this lock, all still queue rather than shed. Shortening it until they
+// start shedding would make those tests pass for the wrong reason.
+const groupLockTimeout = 2 * time.Second
+
 // Repo holds the queries for every table.
-type Repo struct{ pool *pgxpool.Pool }
+type Repo struct{ pool *boundedPool }
 
 // New returns a Repo backed by the given pool.
-func New(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
+func New(pool *pgxpool.Pool) *Repo { return &Repo{pool: &boundedPool{p: pool}} }
