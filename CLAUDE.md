@@ -39,6 +39,60 @@ A change is done when `senior-go` says PASS, `qa-adversarial` has nothing
 CRITICAL or HIGH, and `po` says SHIPS. Correct code that does not help the user
 is not done.
 
+## Branching and pull requests
+
+Nothing lands on a branch by being written. It lands by passing the loop and
+then a pull request.
+
+```
+feature branch  →  PR into develop  →  develop  →  PR into main
+```
+
+- Every change starts on its own branch off `develop`. Never commit to
+  `develop` or `main` directly.
+- **One branch, one feature.** A branch carries a single change with a single
+  reason to exist. Two unrelated fixes on one branch cannot be reviewed
+  separately, cannot be reverted separately, and force a reviewer to hold both
+  in their head at once — which is how the second one gets waved through.
+- **A branch is named `<type>/<issue>-<what>`**, where the issue is its Linear
+  identifier: `fix/my-5-delete-bill-guard`, `feat/my-24-tanstack-router`,
+  `chore/my-16-register-driven-test-app`. The identifier is what lets anyone
+  holding a branch, a commit or a PR find the reasoning behind it without asking.
+
+- **A commit subject is `<type>: <why>`, and its body names the issue.** The
+  type is one of:
+
+  | type | for |
+  |---|---|
+  | `feat` | behaviour a user can notice that did not exist before |
+  | `fix` | behaviour that was wrong |
+  | `refactor` | the same behaviour, arranged differently |
+  | `chore` | tooling, config, dependencies, docs, tests-only |
+
+  `git diff` already shows what changed, so the subject says why it changed:
+  `fix: key the group lock on the group, not on how the URL spelled it`, not
+  `fix: add uuid.Parse to groupIDParam`. Put the identifier in the body on its
+  own line, so Linear links the commit to the issue.
+
+- **A branch is deleted once its PR is merged**, locally and on the remote. A
+  merged branch left lying around is one someone will later mistake for work in
+  progress. Never delete an unmerged branch — its commits go with it.
+- Open the PR into `develop`. The PR body states what the change does, which
+  loop roles have signed off, and what is deliberately left out.
+- A PR merges into `develop` only when the loop has cleared it: the senior says
+  PASS, `qa-adversarial` has nothing CRITICAL or HIGH, `security` has nothing
+  CRITICAL or HIGH, and the PO says SHIPS.
+- `develop` reaches `main` by its own PR, once everything on it has been
+  exercised together. `main` is the branch that is supposed to work; a change
+  that has only ever been tested alone has not earned it.
+
+The gate is the same one the loop already applies — the PR is where it becomes
+visible to someone reading the repo six months from now, rather than living in
+a conversation nobody kept.
+
+Commit messages follow the same rule as comments: say why, not what. `git diff`
+already shows what changed.
+
 ## Rules this codebase holds itself to
 
 Reviews are graded against these, not against personal taste.
