@@ -33,6 +33,15 @@ var ErrPoolBusy = errors.New("repo: no database connection became free")
 // group. It is shorter than middleware.DefaultRequestTimeout, so a saturated
 // pool is reported as a saturated pool rather than being swallowed by the
 // request deadline and reported as a timeout.
+//
+// That last ordering — lock 2s < acquire 5s < request 10s — holds per operation,
+// not per request. pushSummary makes six sequential acquires and createSettlement
+// composes an acquire with a lock wait, so under saturation a later acquire in
+// the same request has less than five seconds of request budget left. acquire
+// then correctly declines to call it ErrPoolBusy (the caller's context is the one
+// that ended) and the client gets the vaguer 504 instead of the 503 this budget
+// was shaped to produce. Accepted: the alternative is a per-request budget
+// divided among an unknown number of acquires, and 504 is still true.
 const poolAcquireTimeout = 5 * time.Second
 
 // boundedPool is pgxpool with the wait for a connection separated from the work
@@ -148,7 +157,10 @@ func (r *poolRows) release() {
 	}
 }
 
-// poolRow returns the connection once the single row has been scanned.
+// poolRow returns the connection once the single row has been scanned. Scan is
+// the only release, so a QueryRow whose result is dropped without scanning
+// strands a pooled connection for the life of the process — chain .Scan onto
+// every QueryRow, as all four call sites and pgxpool's own wrapper do.
 type poolRow struct {
 	row  pgx.Row
 	conn *pgxpool.Conn
