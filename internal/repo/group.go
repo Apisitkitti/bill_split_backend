@@ -150,6 +150,13 @@ func (r *Repo) Members(ctx context.Context, groupID string) ([]model.User, error
 // foreign key violation. The handler turns that into the same 404 a non-member
 // gets, so a 500 on the missing row cannot be used to tell real group IDs from
 // invented ones.
+//
+// This is the one write left outside an explicit transaction, and ON CONFLICT DO
+// NOTHING is why. A deadline landing in the implicit commit's round trip can
+// still leave the row written and report a retryable failure — but the retry
+// inserts nothing and answers the same success, so the caller's correct action is
+// still to retry and it still converges. Contrast DeleteSettlement, which is not
+// idempotent in what it *tells* the caller and had to move into a transaction.
 func (r *Repo) AddMember(ctx context.Context, groupID, userID string) error {
 	_, err := r.pool.Exec(ctx, `
 		INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)

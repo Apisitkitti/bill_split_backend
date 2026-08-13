@@ -47,6 +47,20 @@ var ErrSettlementDepends = errors.New("repo: a recorded settlement depends on th
 // loop that can never succeed.
 var ErrGroupBusy = errors.New("repo: the group is busy")
 
+// ErrOutcomeUnknown reports a commit that neither completed nor provably failed
+// within commitTimeout. It is the one write failure that must not be answered
+// with "please try again": the transaction may be committed, and a retry would
+// record the same money twice.
+//
+// It exists because the detachment in poolTx.Commit is bounded rather than
+// unlimited. Inside that bound the outcome is binary and the caller is told the
+// truth; past it nothing this process can observe says which way the commit went,
+// so the honest answer is to say so and send the caller to look rather than to
+// guess. It should be vanishingly rare — three seconds is a thousand commits'
+// worth of round trip — and one in the logs means the database stalled, not that
+// the request was odd.
+var ErrOutcomeUnknown = errors.New("repo: the commit outcome could not be determined")
+
 // foreignKeyViolation is the SQLSTATE Postgres returns when a row references a
 // parent that is not there.
 const foreignKeyViolation = "23503"

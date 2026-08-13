@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -127,14 +128,29 @@ func newTestApp(t *testing.T) *testApp {
 	}
 
 	ta := &testApp{repo: repo.New(pool), ctx: ctx, pool: pool}
+	ta.app = ta.appWithBudget(t, middleware.DefaultRequestTimeout)
+	return ta
+}
+
+// appWithBudget builds an app over the same handlers with a given request
+// budget. newTestApp uses it with production's, so ta.app is the real thing;
+// the commit-boundary sweep uses it with a budget short enough to walk a
+// deadline through a transaction a few hundred times without the suite taking
+// an hour.
+//
+// The budget is the only difference. Everything from requireMember inwards is
+// the production path in both.
+func (ta *testApp) appWithBudget(t *testing.T, budget time.Duration) *fiber.App {
+	t.Helper()
+
 	h := New(ta.repo, &config.Config{}, stubPusher())
 
-	ta.app = fiber.New()
-	// The same middleware cmd/server mounts, with the same budget. Without it
-	// c.UserContext() is context.Background() and these tests would exercise
-	// handlers that no deadline applies to — which is the bug MY-8 fixed.
-	ta.app.Use(middleware.RequestContext(middleware.DefaultRequestTimeout))
-	api := ta.app.Group("/api", func(c *fiber.Ctx) error {
+	app := fiber.New()
+	// The same middleware cmd/server mounts. Without it c.UserContext() is
+	// context.Background() and these tests would exercise handlers that no
+	// deadline applies to — which is the bug MY-8 fixed.
+	app.Use(middleware.RequestContext(budget))
+	api := app.Group("/api", func(c *fiber.Ctx) error {
 		caller := c.Get(callerHeader)
 		c.Locals(userLocalsKey, model.User{ID: caller})
 		if middleware.CurrentUser(c).ID != caller {
@@ -145,7 +161,7 @@ func newTestApp(t *testing.T) *testApp {
 	})
 	h.registerForTest(api)
 
-	return ta
+	return app
 }
 
 // registerForTest mounts the routes under test directly. Handler.Register wraps
@@ -208,6 +224,13 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 // silent — every caller checks the status it expected.
 func (ta *testApp) do(t *testing.T, as, method, path string, body any) (int, []byte) {
 	t.Helper()
+	return ta.doOn(t, ta.app, as, method, path, body)
+}
+
+// doOn is do against a particular app, for the tests that need a budget other
+// than production's.
+func (ta *testApp) doOn(t *testing.T, app *fiber.App, as, method, path string, body any) (int, []byte) {
+	t.Helper()
 
 	var reader io.Reader
 	if body != nil {
@@ -225,7 +248,7 @@ func (ta *testApp) do(t *testing.T, as, method, path string, body any) (int, []b
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	res, err := ta.app.Test(req, -1)
+	res, err := app.Test(req, -1)
 	if err != nil {
 		t.Errorf("%s %s: %v", method, path, err)
 		return 0, nil

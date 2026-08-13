@@ -59,9 +59,18 @@ func RequestContext(timeout time.Duration) fiber.Handler {
 //
 // Each of these was a bare 500 before, which tells the client nothing and tells
 // a member on a phone to give up. None of them is a fault in the request:
-// retrying is the right response to all three, and the statuses are kept
+// retrying is the right response to three of the four, and the statuses are kept
 // distinct because the operator reading the logs needs to know which resource
 // ran out.
+//
+// The rule the fourth arm exists to keep: a response that instructs a retry must
+// only follow a request that wrote nothing. The 504 below asks for a retry on a
+// write endpoint, and that is safe only because repo commits on a context the
+// deadline cannot cut — either the transaction committed and the caller is told
+// so, or it was cut before commit and nothing was written. Where even that cannot
+// be established, repo says ErrOutcomeUnknown and the caller is sent to look
+// instead of to retry. Weaken either half and this 504 goes back to double-
+// recording money on the retry it asks for.
 //
 // An error that already carries a status was chosen by a handler and is passed
 // through untouched — in particular the 409 that refuses to withdraw a bill a
@@ -85,6 +94,19 @@ func asHTTP(err error) error {
 	case errors.Is(err, repo.ErrGroupBusy):
 		return fiber.NewError(fiber.StatusServiceUnavailable,
 			"this group is busy right now, please try again in a moment")
+
+	// A commit that neither completed nor provably failed. This is the one
+	// failure on this list that must NOT tell the caller to try again: the write
+	// may be in the database, and a retry would record the same payment twice.
+	//
+	// It is checked before the 504 below because both can be true of the same
+	// error — the reason repo folds the underlying context error in with %v
+	// rather than %w — and because "we do not know" outranks "we were slow".
+	// 500 rather than 504: 504 is the status this codebase pairs with "retry",
+	// and the message is the only thing that stops the caller doing exactly that.
+	case errors.Is(err, repo.ErrOutcomeUnknown):
+		return fiber.NewError(fiber.StatusInternalServerError,
+			"we could not confirm whether this was saved — open the group and check before recording it again")
 
 	// The query ran and ran out of time. 504 rather than the 503s above so that
 	// "we were too slow" stays separable from "we had no capacity to start", and
