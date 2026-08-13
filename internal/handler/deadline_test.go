@@ -28,6 +28,11 @@ import (
 // because two of them need a budget shorter than production's ten seconds to run
 // in a reasonable time. newTestApp is still called first: it holds the suite
 // lock and truncates, which every database-backed test in this package needs.
+//
+// Because these apps are not the server's app, none of them can see a middleware
+// mounted in the wrong order — which is how RequestContext shipped above fiber's
+// logger, translating nothing. That order is covered in cmd/server, through the
+// function the server itself calls.
 
 // A query that outlives its budget must end, and must say so in a status the
 // caller can act on rather than a bare 500.
@@ -74,17 +79,23 @@ func TestAQueryPastItsDeadlineIsAGatewayTimeout(t *testing.T) {
 	}
 }
 
-// A client that hangs up must take its query with it.
+// An abandoned request must not run forever.
 //
-// fasthttp will not tell us this by itself — RequestCtx.Done() closes only on
-// server shutdown — so the request is served over a real socket here, and the
-// client cancels mid-flight. What is asserted is the server side: the query has
-// to come back with an error long before the thirty seconds it asked Postgres
-// for. Deleting the watchDisconnect call fails this — the query runs on to the
-// request deadline with nobody left to read it, holding a pooled connection the
-// whole way.
-func TestAClientThatHangsUpDoesNotLeaveItsQueryRunning(t *testing.T) {
+// This used to assert that a disconnect *itself* stopped the query, via a socket
+// watcher that has since been deleted: it cancelled live requests, because a
+// client that half-closes after sending — legal, and what Go's own client does on
+// cancel — looks exactly like one that left. Nothing detects the disconnect now,
+// so what is asserted is the bound that actually holds: the query ends at the
+// request deadline and gives its pooled connection back, whether or not anyone is
+// still reading. The request is still served over a real socket and still
+// abandoned mid-flight, because that is the situation the bound exists for.
+func TestAnAbandonedRequestIsBoundedByItsDeadline(t *testing.T) {
 	ta := newTestApp(t)
+
+	// Short enough to wait for, and far short of the thirty seconds the query
+	// asks Postgres for: if the query stops, only the deadline can have stopped
+	// it.
+	const budget = 500 * time.Millisecond
 
 	type outcome struct {
 		err   error
@@ -93,9 +104,7 @@ func TestAClientThatHangsUpDoesNotLeaveItsQueryRunning(t *testing.T) {
 	done := make(chan outcome, 1)
 
 	app := fiber.New()
-	// Deliberately far longer than the test's patience: if the query stops, the
-	// disconnect is the only thing that could have stopped it.
-	app.Use(middleware.RequestContext(60 * time.Second))
+	app.Use(middleware.RequestContext(budget))
 	app.Get("/slow", func(c *fiber.Ctx) error {
 		start := time.Now()
 		_, err := ta.pool.Exec(c.UserContext(), `SELECT pg_sleep(30)`)
@@ -108,7 +117,12 @@ func TestAClientThatHangsUpDoesNotLeaveItsQueryRunning(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	go func() { _ = app.Listener(ln) }()
-	t.Cleanup(func() { _ = app.Shutdown() })
+	// Closing the listener rather than calling app.Shutdown, which under -race
+	// reports fasthttp writing Server.done while a live RequestCtx.Done() reads
+	// it — a race inside the library, reachable from any request whose context
+	// wraps c.Context(), and nothing this test is about. It was already flaky here
+	// before this test was rewritten.
+	t.Cleanup(func() { _ = ln.Close() })
 
 	reqCtx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet,
@@ -119,7 +133,7 @@ func TestAClientThatHangsUpDoesNotLeaveItsQueryRunning(t *testing.T) {
 
 	// Long enough that the query is certainly running, short enough that the
 	// whole test is quick.
-	time.AfterFunc(500*time.Millisecond, cancel)
+	time.AfterFunc(200*time.Millisecond, cancel)
 
 	res, err := http.DefaultClient.Do(req)
 	if err == nil {
@@ -130,16 +144,15 @@ func TestAClientThatHangsUpDoesNotLeaveItsQueryRunning(t *testing.T) {
 	select {
 	case got := <-done:
 		if got.err == nil {
-			t.Error("the query ran to completion even though the client had gone")
+			t.Error("the query ran to completion with nobody left to read it")
 		}
-		// The client left at 500ms and the connection is polled every 250ms, so
-		// anything past a couple of seconds means the query was not cancelled
-		// but simply finished, or was cancelled by something much later.
-		if got.spent > 3*time.Second {
-			t.Errorf("the query kept running %v after the client hung up", got.spent)
+		// Removing SetUserContext fails this: the sleep runs its full thirty
+		// seconds on a connection nobody is waiting for.
+		if got.spent > budget+2*time.Second {
+			t.Errorf("the query ran %v on a %v budget", got.spent, budget)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("the query outlived its client by more than 10s; the disconnect cancelled nothing")
+		t.Fatal("the abandoned query outlived its budget by more than 10s")
 	}
 }
 

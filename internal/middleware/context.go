@@ -21,11 +21,6 @@ import (
 // seconds, so anything that does is already a fault rather than slow work.
 const DefaultRequestTimeout = 10 * time.Second
 
-// StatusClientClosedRequest is nginx's 499. There is no registered status for
-// "the caller hung up", and by definition nobody reads this one; it exists so
-// the access log distinguishes an abandoned request from a server fault.
-const StatusClientClosedRequest = 499
-
 // RequestContext gives every request a database context with a deadline, and
 // translates the failures that deadline produces into statuses.
 //
@@ -38,22 +33,25 @@ const StatusClientClosedRequest = 499
 //
 // It is mounted with app.Use rather than called from each handler, so it is not
 // something a route added later can forget: a handler is reached through it or
-// it is not reached at all.
+// it is not reached at all. It must be mounted *below* fiber's logger — see
+// mountMiddleware in cmd/server — or the translation below never runs.
 //
 // The parent is the fasthttp request context, so a server shutdown cancels
-// in-flight queries too. Client disconnect is *not* covered by that parent —
-// fasthttp's RequestCtx.Done() is closed only when the server is shutting down,
-// which is what watchDisconnect exists to make up for.
+// in-flight queries too. A client that hangs up is *not* covered by that parent:
+// fasthttp's RequestCtx.Done() closes only on shutdown, and nothing here tries to
+// detect the disconnect itself. An earlier version of this file polled the socket
+// with MSG_PEEK; it cancelled live requests — a client that half-closes after
+// sending, which is legal and common, is indistinguishable from one that left —
+// and it could not see through TLS at all. The timeout is the bound that holds:
+// an abandoned request costs one connection for at most this long, without
+// anyone guessing at socket state.
 func RequestContext(timeout time.Duration) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		ctx, cancel := context.WithTimeout(c.Context(), timeout)
 		defer cancel()
 
-		stop := watchDisconnect(c.Context().Conn(), cancel)
-		defer stop()
-
 		c.SetUserContext(ctx)
-		return asHTTP(ctx, c.Next())
+		return asHTTP(c.Next())
 	}
 }
 
@@ -69,7 +67,7 @@ func RequestContext(timeout time.Duration) fiber.Handler {
 // through untouched — in particular the 409 that refuses to withdraw a bill a
 // settlement depends on, which is a permanent no and must never be confused with
 // the 503 below that means "the group is busy, try again".
-func asHTTP(ctx context.Context, err error) error {
+func asHTTP(err error) error {
 	if err == nil {
 		return nil
 	}
@@ -91,12 +89,22 @@ func asHTTP(ctx context.Context, err error) error {
 	// The query ran and ran out of time. 504 rather than the 503s above so that
 	// "we were too slow" stays separable from "we had no capacity to start", and
 	// the message names neither the table nor the statement.
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
+	//
+	// Matched on err alone. Asking ctx.Err() as well relabelled *any* error that
+	// happened to arrive after the deadline had fired — a validation 400 from a
+	// slow handler included — as a timeout it was not.
+	case errors.Is(err, context.DeadlineExceeded):
 		return fiber.NewError(fiber.StatusGatewayTimeout,
 			"this took too long, please try again")
 
-	case errors.Is(err, context.Canceled), errors.Is(ctx.Err(), context.Canceled):
-		return fiber.NewError(StatusClientClosedRequest, "client closed request")
+	// Nothing cancels this context except a parent that was cancelled, and the
+	// only thing that cancels the parent is ShutdownWithTimeout. So this is the
+	// server going away mid-request, not the client — it used to answer 499
+	// ("client closed request"), which was a lie about a caller who was still
+	// waiting, and 499 has no other source now that nothing watches the socket.
+	case errors.Is(err, context.Canceled):
+		return fiber.NewError(fiber.StatusServiceUnavailable,
+			"the server is restarting, please try again in a moment")
 	}
 
 	return err
