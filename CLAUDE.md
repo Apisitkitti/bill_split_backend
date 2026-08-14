@@ -162,6 +162,33 @@ internal/middleware/ auth
 migrations/          goose
 ```
 
+## Where this runs
+
+Development is a local Postgres (`make db`). Production is **Neon** in
+`ap-southeast-1`, on its **direct** endpoint — never the `-pooler` host.
+
+The pooler is the thing to be careful about. It is pgbouncer, and in transaction
+mode `pg_advisory_xact_lock` and `set_config(..., true)` both survive because
+both are transaction-scoped. But that is a property of a mode we do not control,
+nothing in this code would notice it changing, and a session-mode pooler
+reopens the delete-guard race in a way no test would catch. `MaxConns` is 10;
+this app has no use for a pooler in the first place.
+
+Development stays local because of round trips, not correctness. Every statement
+costs ~32ms to Neon against ~0.3ms locally, and `CreateSettlement` alone makes
+five inside its transaction — `Begin`, the lock, the ledger read, the insert, the
+commit. The guards all pass against Neon (verified: the concurrency race, the
+lock-spelling race, and MY-8's cross-group acceptance criterion at 2.31s against
+a 6s bound). What does not survive is patience: the full suite goes from about 45
+seconds to over twenty minutes, because the commit-boundary sweep alone is 60
+adaptive trials across four endpoints.
+
+That gap is also a warning about the numbers in this file. Every timing figure
+`security` and `qa-adversarial` measured — pool saturation, lock hold, the
+150ms-versus-1.5ms transaction — was measured against a local database. On Neon
+the lock is held roughly a hundred times longer, which does not break any bound
+but does move the concurrency at which a real group starts seeing 503s.
+
 ## Commands
 
 ```bash
